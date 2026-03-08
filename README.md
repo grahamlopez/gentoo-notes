@@ -1178,7 +1178,6 @@ Can use yubikey and keep TOTP codes as alternative/backup.
 
 So just use the built-in openssh agent, no keyring utility needed with some shell jankery (see `.zshrc` and `.utils/lazy_ssh.sh`)
 
-
 # Future Enhancements
 
 ## unsorted list
@@ -1413,9 +1412,8 @@ and USE flags of nvgen and flattop
     - console and keyd keymaps
     - root dotfiles: zsh, tmux
         - stripped down nvim
-    - graham dotfiles because of ssh key
     - /etc/hosts
-    - sudo, autologin, auto hyprland
+    - sudo, autologin
     - switch root shell to zsh
 - disable systemd stuff
 - graphics setup
