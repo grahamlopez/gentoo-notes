@@ -14,6 +14,7 @@ net-misc/dhcpcd
 net-wireless/iw
 net-wireless/wpa_supplicant
 sys-apps/fd
+sys-apps/keyutils
 sys-apps/lm-sensors
 sys-apps/nvme-cli
 sys-apps/pciutils

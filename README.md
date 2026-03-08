@@ -1143,6 +1143,42 @@ Here's the current setup:
 - ssh keys, proton passwords, wpa_supplicant, yubikeys, luks keyfiles
     - https://protonpass.github.io/pass-cli/get-started/configuration/#secure-key-storage
 
+## proton pass cli
+
+```
+curl -fsSL https://proton.me/download/pass-cli/install.sh | bash
+```
+
+Then some usage:
+
+```
+pass-cli login --interactive
+pass-cli item view pass://utils/gza-ssh-key --output json | jq
+pass-cli item view pass://utils/gza-ssh-key/public_key > ~/.ssh/id_ed25519.pub
+```
+
+pass-cli uses the kernel keyring; `emerge -av keyutils` to take a look `keyctl show`
+
+## yubikey
+
+### ssh keys on yubikey
+
+### proton FIDO2
+
+Can use yubikey and keep TOTP codes as alternative/backup.
+
+### luks decrypt
+
+### mobile (NFC)
+
+## ssh keys
+
+[a very thorough cloudflare article on the kernel keyring](https://blog.cloudflare.com/the-linux-kernel-key-retention-service-and-why-you-should-use-it-in-your-next-application/)
+- note this isn't yet supported for ed25519 keys, only RSA which suck
+
+So just use the built-in openssh agent, no keyring utility needed with some shell jankery (see `.zshrc` and `.utils/lazy_ssh.sh`)
+
+
 # Future Enhancements
 
 ## unsorted list
@@ -1388,6 +1424,11 @@ and USE flags of nvgen and flattop
 - fonts setup
     - minimize but get everything
     - nerd fonts, kaomoji, greek
+    - media-fonts/dejavu                    a common font that I don't use much
+    - media-fonts/fira-code                 a decent font that I don't use much
+    - media-fonts/fira-mono                 a decent font that I don't use much
+    - media-fonts/noto-cjk                  for things shrug and table flip emoji
+    - media-fonts/noto-emoji                emoji font
 - getting local/apps/{tmux,neovim} installed
     - easy enough from source
 - putting /usr/local/bin scripts in place

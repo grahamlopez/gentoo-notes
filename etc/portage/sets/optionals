@@ -1,0 +1,16 @@
+app-misc/evtest                       for debugging keyboard events
+dev-tex/tectonic                      self-contained xelatex-based latex
+dev-vcs/lazygit                       git tui application
+media-fonts/dejavu                    a common font that I don't use much
+media-fonts/fira-code                 a decent font that I don't use much
+media-fonts/fira-mono                 a decent font that I don't use much
+media-fonts/noto-cjk                  for things shrug and table flip emoji
+media-fonts/noto-emoji                emoji font
+media-video/ffmpeg                    to enable tidal playback in firefox
+net-libs/nodejs                       neovim dependency
+net-misc/rclone                       easily mount pcloud
+net-p2p/syncthing                     automatic file syncing - replace dropbox
+sys-firmware/sof-firmware             (nvgen only - needed for sound card)
+sys-fs/ncdu                           fast interactive disk cleanup
+x11-apps/xev                          another input event viewer
+x11-misc/pywal16                      generate colorschemes from an image
