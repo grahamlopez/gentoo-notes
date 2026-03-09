@@ -1,6 +1,0 @@
-# from taskset -c 0-15 resolve-march-native to allow sys-devel/gcc to emerge
-# these flags get stripped by portage to "-march=alderlake -O2 -pipe" anyway
-
-# for flattop
-CFLAGS="-march=alderlake -mabm -mno-cldemote -mno-kl -mno-pconfig -mno-sgx -mno-widekl -mshstk --param=l1-cache-line-size=64 --param=l1-cache-size=32 --param=l2-cache-size=18432 -O2 -pipe"
-CXXFLAGS="${CFLAGS}"
