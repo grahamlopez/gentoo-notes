@@ -633,43 +633,7 @@ installed a `/etc/modprobe.d/nvidia.conf` and whatever else it needed.
 
 ## This is a work in progress.
 
-first pass (starfighter)
-
-To see the current state of things, especially how it relates to boot process
-and times:
-
-```
-systemd-analyze
-systemd-analyze blame
-systemd-analyze critical-chain
-```
-
-Now disable some of the most obvious stuff
-
-```
-systemctl mask remote-cryptsetup.target remote-fs.target remote-integritysetup.target remote-veritysetup.target
-systemctl disable systemd-networkd-wait-online.service
-systemctl disable systemd-networkd.service systemd-network-generator.service systemd-networkd-persistent-storage.service systemd-networkd.socket systemd-networkd-varlink.socket
-systemctl disable systemd-nsresourced.service systemd-nsresourced.socket
-```
-
-Some potentially helpful things to disable, but might want to look into use in the future?
-
-```
-systemctl disable systemd-pstore.service systemd-sysext.service systemd-confext.service
-```
-
-Even with dhcpcd+wpa_supplicant (no systemd-networkd), systemd-resolved is helpful for VPN, split DNS, and DNS-over-TLS setups. If none of those apply:
-
-```
-systemctl disable systemd-resolved.service systemd-resolved-varlink.socket systemd-resolved-monitor.socket
-```
-
-Could always disable NTP if you aren't worried about clock drift or DST
-
-```
-systemctl disable systemd-timesyncd.service
-```
+Note that there is a now a util script in the gentoo-configs repo to help with this
 
 # laptop power profiles
 
@@ -683,135 +647,21 @@ cat /sys/devices/system/cpu/intel_pstate/status /sys/devices/system/cpu/intel_ps
 
 This is automated by monitoring `/sys/class/power_supply/ADP1/online` with udev and triggering a minimal systemd service that calls a script to write to the sysfs values above. I am told that skipping systemd and using udev to call the script is less robust, plus we lose debug logging.
 
-TODO: reference the up-to-date versions of the scripts below in gentoo-configs:/usr/local/sbin
-
 ## General power profile setup (cpu only)
 
+All of these files get deployed along with the other system configs, but they still need to be enabled manually at at this point
+
 The script for `/usr/local/sbin/set-power-profile.sh` (cpu power only)
-``` 
-#!/bin/sh
-# Usage: set-power-profile.sh ac|battery
-
-INTEL_PSTATE_DIR=/sys/devices/system/cpu/intel_pstate
-
-case "$1" in
-  battery)
-    echo 40 > "$INTEL_PSTATE_DIR/max_perf_pct"
-    echo 1  > "$INTEL_PSTATE_DIR/no_turbo"
-    ;;
-  ac)
-    echo 100 > "$INTEL_PSTATE_DIR/max_perf_pct"
-    echo 0   > "$INTEL_PSTATE_DIR/no_turbo"
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-```
 
 systemd template service goes in `/etc/systemd/system/power-profile@.service`
-```
-[Unit]
-Description=Set power profile: %I
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/set-power-profile.sh %I
-```
 
 we also need a service to run at boot to set the correct initial state; goes in `/etc/systemd/system/power-profile-init.service`
-```
-[Unit]
-Description=Set initial power profile based on AC state
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c '\
-  AC_DIR=/sys/class/power_supply/ADP1; \
-  if [ -r "$AC_DIR/online" ] && [ "$(cat "$AC_DIR/online")" = "1" ]; then \
-    /usr/local/sbin/set-power-profile.sh ac; \
-  else \
-    /usr/local/sbin/set-power-profile.sh battery; \
-  fi'
-
-[Install]
-WantedBy=multi-user.target
-```
-and enable it `systemctl enable power-profile-init.service`
+and enable it with `systemctl enable power-profile-init.service`
 
 Finally, our udev rule to react to AC plug/unplug goes in `/etc/udev/rules.d/99-power-profile.rules`
-```
-SUBSYSTEM=="power_supply", KERNEL=="ADP1", ATTR{online}=="1", \
-  RUN+="/usr/bin/systemctl start power-profile@ac.service"
-
-SUBSYSTEM=="power_supply", KERNEL=="ADP1", ATTR{online}=="0", \
-  RUN+="/usr/bin/systemctl start power-profile@battery.service"
-```
 and reload udev with `udevadm control --reload`
 
-## add nvme and wifi to power profile
-
-modify `/usr/local/sbin/set-power-profile.sh` to
-```
-#!/bin/sh
-# Usage: set-power-profile.sh ac|battery
-
-INTEL_PSTATE_DIR=/sys/devices/system/cpu/intel_pstate
-WIFI_IFACE="wlp1s0"
-NVME_DEVS="nvme0 nvme1"
-
-set_cpu_battery() {
-  echo 40 > "$INTEL_PSTATE_DIR/max_perf_pct"
-  echo 1  > "$INTEL_PSTATE_DIR/no_turbo"
-}
-
-set_cpu_ac() {
-  echo 100 > "$INTEL_PSTATE_DIR/max_perf_pct"
-  echo 0   > "$INTEL_PSTATE_DIR/no_turbo"
-}
-
-set_nvme_battery() {
-  for dev in $NVME_DEVS; do
-    base="/sys/class/nvme/$dev"
-    [ -d "$base" ] || continue
-    echo auto > "$base/device/power/control" 2>/dev/null || true
-  done
-}
-
-set_nvme_ac() {
-  for dev in $NVME_DEVS; do
-    base="/sys/class/nvme/$dev"
-    [ -d "$base" ] || continue
-    echo on > "$base/device/power/control" 2>/dev/null || true
-  done
-}
-
-set_wifi_battery() {
-  iw dev "$WIFI_IFACE" set power_save on 2>/dev/null || true
-}
-
-set_wifi_ac() {
-  iw dev "$WIFI_IFACE" set power_save off 2>/dev/null || true
-}
-
-case "$1" in
-  battery)
-    set_cpu_battery
-    set_nvme_battery
-    set_wifi_battery
-    ;;
-  ac)
-    set_cpu_ac
-    set_nvme_ac
-    set_wifi_ac
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-```
+nvme and wifi were also added to the `set-power-profile.sh` file. Those details have been removed from here as they are tracked in the configs repo and get deployed there.
 
 ## improved power status reporting script
 
@@ -940,8 +790,7 @@ This is mostly solved with the tried and true bare repo / working dir solution, 
 
 ## system configs
 
-This roughly follows the same method as the user dotfiles, but with a couple of modifications
-1. need to get permissions right and consistent, so I've put a script in the repo's utils directory
+This roughly follows the same method as the user dotfiles, but git is bad at permissions, so I've put a helper fixup script in the repo's utils directory
 
 ## kernel configurations
 
@@ -1142,7 +991,6 @@ device {
 
 # install friction
 
-- disable systemd stuff
 - graphics setup
     - disable nouveau
     - set up auto power for gpu
