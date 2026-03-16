@@ -699,6 +699,7 @@ keep useful packages around that I want
 
 Things I have wanted at some point in the past:
 
+- nerdfonts
 - ncdu without llvm deps
   - https://dev.yorhel.nl/ncdu
 - nightly neovim
