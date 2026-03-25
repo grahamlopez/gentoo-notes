@@ -419,6 +419,7 @@ Here is the recipe:
 - rebuild the kernel
 - `cp arch/x86/boot/bzImage /boot/EFI/boot/boot64x.efi`
 - `efibootmgr --create --disk /dev/nvme0n1 --part 1 --label "gentoo" --loader /EFI/boot/bootx64.efi`
+  - or currently on startop: `efibootmgr --create --index 6 --full-dev-path --disk /dev/nvme1n1 --part 1 --label "gentoo" --loader /EFI/boot/boot64x.efi`
 
 Note: recently I like to disable the initramfs compression in the kernel so that decompression isn't needed at boot. This also means that `unxz` is needed between `genkernel --luks initramfs` and building it into the kernel
 
