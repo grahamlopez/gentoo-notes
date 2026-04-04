@@ -809,6 +809,7 @@ low effort, some are very high.
 - build up from smaller (non-desktop) profile
 - telescope search icons in nvim for "disk" and see many squares and kanji
 - screenlocking and fingerprint reader
+- cryptsetup-luksSuspend for /home protection during sleep
 - user mount removable devices
 - more theming (with fast/auto switching): wallpaper+colors/pywal16+fonts
 - virutalization:
