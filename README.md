@@ -992,6 +992,135 @@ device {
 }
 ```
 
+# bequiet sensors
+
+## fan control
+
+The IT8688E is not in your kernel's it87 supported chip list. Your kernel (6.18.18-gentoo-dist) has the mainline it87 driver which doesn't include IT8688E support. This is why only the secondary IT8792E at
+0xa60 was found — the IT8688E at 0xa30 was both unsupported and ACPI-blocked.
+
+Here's the situation and path forward:
+
+What's Happening
+
+┌─────────┬─────────┬───────────────────────────────────────────────────┬──────────────────────────────────────────────────┐
+│  Chip   │ Address │                       Role                        │                      Status                      │
+├─────────┼─────────┼───────────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│ IT8688E │ 0xa30   │ Primary — controls CPU_FAN, CPU_OPT, SYS_FAN1/2/4 │ Not detected (no driver support + ACPI conflict) │
+├─────────┼─────────┼───────────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│ IT8792E │ 0xa60   │ Secondary — monitors fan3 only                    │ Working, sees 1 fan                              │
+└─────────┴─────────┴───────────────────────────────────────────────────┴──────────────────────────────────────────────────┘
+
+Your BIOS can see all fans because it talks to the IT8688E directly. Linux can't.
+
+Fix: Out-of-Tree it87 Driver
+
+The mainline kernel doesn't support IT8688E, but the community it87 driver does. On Gentoo, you'll need to:
+
+Step 1: Install the out-of-tree it87 module. Run these interactively (they need sudo):
+
+## Clone the community it87 driver that supports IT8688E
+git clone https://github.com/frankcrawford/it87.git /tmp/it87-oot
+cd /tmp/it87-oot
+make
+sudo make install
+
+## Remove the in-tree module and load the new one
+sudo modprobe -r it87
+sudo modprobe it87 ignore_resource_conflict=1
+
+Step 2: Make it persistent:
+
+## Load the out-of-tree one with the resource conflict override
+echo "options it87 ignore_resource_conflict=1" | sudo tee /etc/modprobe.d/it87.conf
+
+## Rebuild module dependencies
+sudo depmod -a
+
+Step 3: After reloading, sensors should show a second it87 device (the IT8688E) with all 5 fans visible. We can then set up fancontrol with proper curves for all fans — critically tying case fan speed to GPU
+temperature via nvidia-smi for the incoming RTX PRO 6000 Ada.
+
+## Fan Control Setup for Gigabyte X570 Aorus Master (rev 1.1)
+
+Prerequisites
+
+1. Out-of-tree it87 driver — the mainline kernel's it87 module doesn't support the IT8688E. Clone and build from
+https://github.com/frankcrawford/it87, then make && sudo make install. This overwrites the in-tree module. Must be rebuilt after each kernel
+update.
+2. Module config — two files:
+  - /etc/modprobe.d/it87.conf: options it87 ignore_resource_conflict=1
+  - /etc/modules-load.d/lm_sensors.conf: it87
+
+No blacklist file — the out-of-tree module replaces the in-tree one at the same path.
+3. Fan header wiring:
+  - CPU_FAN → CPU heatsink fan (BIOS controlled)
+  - CPU_OPT → CPU heatsink fan (BIOS controlled)
+  - SYS_FAN1 → Rear exhaust (IT8688E pwm2, software controlled)
+  - SYS_FAN2 → Front bottom intake, BQ SW3 HF (IT8688E pwm3, software controlled)
+  - SYS_FAN4 → Front top intake, BQ SW3 LF (not software controllable, runs fixed ~400 RPM)
+4. Install the service:
+    cp gpu-fan-control.sh /usr/local/sbin/
+    cp gpu-fan-control.service /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now gpu-fan-control.service
+5. Fan curve (GPU temp → case fan speed): 40°C/30% → 50°C/40% → 60°C/50% → 70°C/65% → 78°C/80% → 85°C/100%. Falls back to CPU temp if GPU is
+unavailable, full speed if neither is readable.
+
+## gpu-fan-control.service
+
+```
+[Unit]
+Description=GPU-reactive case fan controller
+After=lm_sensors.service nvidia-persistenced.service
+Wants=lm_sensors.service
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe it87
+ExecStart=/usr/local/sbin/gpu-fan-control.sh
+Restart=on-failure
+RestartSec=5
+
+# Restore BIOS control if the service is stopped
+ExecStopPost=/usr/local/sbin/gpu-fan-control.sh --restore
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Defaults now
+
+- VERBOSE_LOGGING=0
+- PWM_CHANGE_THRESHOLD=8
+
+So under normal use, journald should stay pretty quiet.
+
+To enable per-adjustment logging temporarily
+
+Run the service with:
+
+```bash
+  sudo systemctl set-environment VERBOSE_LOGGING=1
+  sudo systemctl restart gpu-fan-control.service
+```
+
+Clear it again:
+
+```bash
+  sudo systemctl unset-environment VERBOSE_LOGGING
+  sudo systemctl restart gpu-fan-control.service
+```
+
+To tune the threshold
+
+Example: make it less twitchy
+
+```bash
+  sudo systemctl set-environment PWM_CHANGE_THRESHOLD=12
+  sudo systemctl restart gpu-fan-control.service
+```
+
+
 # install friction
 
 - graphics setup
