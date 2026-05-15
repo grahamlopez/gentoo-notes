@@ -457,6 +457,14 @@ Device Drivers  --->
       (/lib/firmware) Firmware blobs root directory
 ```
 
+Or, if you're running a dist kernel and don't want to rebuild, pre-load it as initrd, so add to the kernel cmdline
+
+```
+efibootmgr --create --index 4 --disk /dev/nvme0n1 --part 1 --label "gentoo-xe" --loader /EFI/boot/boot64x-dist.efi --unicode ' crypt_root=UUID=bb68e492-9d7f-461d-8a1d-704532c1d12e root=UUID=707a4604-08f7-458a-82fc-9aa29ebcbd83 ro root_trim=yes initrd=/EFI/boot/intel-uc.img initrd=/EFI/boot/initrd-dist'
+```
+
+Note that the microcode must come before the actual initrd.
+
 Might as well build in the blobs from `/etc/portage/savedconfig/sys-kernel/linux-firmware` as well
 
 On startop, the relevant part of `.config` looks like:
