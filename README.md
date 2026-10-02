@@ -20,7 +20,134 @@ that will do a lot more automatically.
 - set up encryption
   - cryptsetup luksFormat
 - make and mount filesystems
-  - vfat for boot, ext4 for /dev/mapper/root
+  - vfat for boot, btrfs for /dev/mapper/cryptroot
+
+### installing btrfs
+
+(hints from [perplexity](https://www.perplexity.ai/search/f76adce3-bef4-4aeb-8b38-2d6fdaff6b29))
+
+The compact summary:
+
+```
+# Destructive: confirm the target device first.
+mkfs.btrfs -L GENTOO -d single -m dup /dev/mapper/cryptroot
+
+mkdir -p /mnt/gentoo
+mount -o subvolid=5 /dev/mapper/cryptroot /mnt/gentoo
+
+btrfs subvolume create /mnt/gentoo/@
+btrfs subvolume create /mnt/gentoo/@home
+
+umount /mnt/gentoo
+
+mount -o subvol=@,noatime,compress=zstd:1 \
+  /dev/mapper/cryptroot /mnt/gentoo
+
+mkdir -p /mnt/gentoo/home
+mount -o subvol=@home,noatime,compress=zstd:1 \
+  /dev/mapper/cryptroot /mnt/gentoo/home
+
+mkdir -p /mnt/gentoo/efi
+mount /dev/nvme0n1p1 /mnt/gentoo/efi
+
+findmnt -R /mnt/gentoo
+```
+
+#### btrfs installation details
+
+```
+/dev/nvme0n1
+├── p1   EFI System Partition, FAT32, 1 GiB        → /efi
+└── p2   LUKS2 container
+    └── /dev/mapper/cryptroot
+        └── Btrfs filesystem
+            ├── @                                  → /
+            └── @home                              → /home
+```
+
+Open the LUKS container, then create a single device filesystem to hold the subvolumes:
+
+```
+mkfs.btrfs \
+  --label GENTOO \
+  --data single \
+  --metadata dup \
+  /dev/mapper/cryptroot
+```
+
+A newly created Btrfs filesystem contains a top-level subvolume, normally ID 5. Mount it only as a staging area in which to create the actual install subvolumes:
+
+```
+mount -o subvolid=5 /dev/mapper/cryptroot /mnt/gentoo
+
+btrfs subvolume create /mnt/gentoo/@
+btrfs subvolume create /mnt/gentoo/@home
+```
+
+Check with `btrfs subvolume list /mnt/gentoo` should show
+
+```
+ID 256 gen ... path @
+ID 257 gen ... path @home
+```
+
+Do not install the stage3 into /mnt/gentoo while this top-level subvolume is mounted. Your Gentoo root needs to land in @, or later snapshots of the intended root will be awkward or useless.
+
+Unmount and remount `@` as `/` and the `home` subvolume within it:
+
+```
+umount /mnt/gentoo
+
+mount \
+  -o subvol=@,noatime,compress=zstd:1 \
+  /dev/mapper/cryptroot \
+  /mnt/gentoo
+
+mkdir -p /mnt/gentoo/home
+
+mount \
+  -o subvol=@home,noatime,compress=zstd:1 \
+  /dev/mapper/cryptroot \
+  /mnt/gentoo/home
+```
+
+Btrfs supports mounting a particular subvolume by `subvol=<path>` or `subvolid=<ID>`; using the readable path names `@` and `@home` in your install and later `/etc/fstab` is easier to audit and recover than using numeric IDs.
+
+#### btrfs setup in /etc/fstab
+
+some conservative settings to start
+
+```
+UUID=<btrfs-uuid>  /      btrfs  noatime,compress=zstd:1,subvol=@      0 0
+UUID=<btrfs-uuid>  /home  btrfs  noatime,compress=zstd:1,subvol=@home  0 0
+UUID=<esp-uuid>    /efi   vfat   umask=0077                           0 2
+```
+
+Why these options
+
+- compress=zstd:1 is a low-CPU setting that is appropriate for a laptop root filesystem. Btrfs supports Zstd compression levels 1–15; level 1 is a good conservative starting choice for interactive systems.
+
+- noatime avoids access-time write churn. Btrfs documentation notes that this can be particularly useful with snapshotting, because atime updates can create copy-on-write churn after a snapshot. Do not use it if you rely on traditional atime-based mail workflows such as classic mbox/Mutt behavior.
+
+- Do not add ssd. Modern Btrfs detects non-rotational devices automatically, and the old SSD-specific allocation behavior no longer offers a general benefit on modern SSDs.
+
+- Do not add space_cache=v2; it is the current default via the free-space tree.
+
+- Do not add autodefrag reflexively. It can be unsuitable for large database-like or VM workloads and can break reflink sharing, increasing snapshot space use.
+
+- Do not add discard=async unless you have a particular reason. On current kernels it is automatically the default when supported; a scheduled fstrim service is also a valid later choice.
+
+- Do not use nodatacow, nodatasum, or compress-force globally. nodatacow turns off checksums and compression for newly created files, which is precisely the wrong default for your root and home filesystem.
+
+#### btrfs boot support
+
+Of course the kernel needs support: `CONFIG_BTRFS_FS=y`
+
+Then the boot cmdline needs something like
+
+```
+root=/dev/mapper/cryptroot rootfstype=btrfs rootflags=subvol=@
+```
 
 ## install base system
 
