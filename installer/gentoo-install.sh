@@ -103,125 +103,15 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-verification_error() {
-  printf 'error: disk setup verification failed: %s\n' "$*" >&2
-  return 1
+run_privileged() {
+  if (( EUID == 0 )); then
+    "$@"
+  else
+    sudo -- "$@"
+  fi
 }
 
-mount_has_option() {
-  local mountpoint=$1 expected_option=$2 options option
-
-  options=$(findmnt --noheadings --output OPTIONS --target "$mountpoint") || return 1
-  IFS=, read -r -a options <<<"$options"
-  for option in "${options[@]}"; do
-    [[ $option == "$expected_option" ]] && return 0
-  done
-  return 1
-}
-
-mount_uses_subvolume() {
-  local mountpoint=$1 expected_subvolume=$2
-
-  mount_has_option "$mountpoint" "subvol=$expected_subvolume" \
-    || mount_has_option "$mountpoint" "subvol=/$expected_subvolume"
-}
-
-verify_disk_setup() {
-  # This is a production gate: disk setup calls it before allowing later
-  # installer phases to use the prepared filesystem.
-  local efi_type crypt_type mapper_device luks_version filesystem_type label
-  local mount_source mount_fstype target_disk_name subvolume
-
-  for command in lsblk readlink awk cryptsetup blkid btrfs findmnt mountpoint; do
-    command -v "$command" >/dev/null 2>&1 \
-      || verification_error "required command is unavailable: $command" || return 1
-  done
-
-  [[ $(lsblk --noheadings --output PTTYPE "$TARGET_DISK" | awk 'NR == 1 { print tolower($1) }') == gpt ]] \
-    || verification_error "target does not have a GPT partition table: $TARGET_DISK" || return 1
-  target_disk_name=${TARGET_DISK##*/}
-  [[ $(lsblk --noheadings --output PKNAME "$EFI_PARTITION" | awk 'NR == 1 { print $1 }') == "$target_disk_name" ]] \
-    || verification_error "EFI partition is not on the target disk: $EFI_PARTITION" || return 1
-  [[ $(lsblk --noheadings --output PKNAME "$CRYPT_PARTITION" | awk 'NR == 1 { print $1 }') == "$target_disk_name" ]] \
-    || verification_error "LUKS partition is not on the target disk: $CRYPT_PARTITION" || return 1
-
-  efi_type=$(lsblk --noheadings --output PARTTYPE "$EFI_PARTITION" | awk 'NR == 1 { print tolower($1) }')
-  crypt_type=$(lsblk --noheadings --output PARTTYPE "$CRYPT_PARTITION" | awk 'NR == 1 { print tolower($1) }')
-  [[ $efi_type == c12a7328-f81f-11d2-ba4b-00a0c93ec93b ]] \
-    || verification_error "EFI partition has the wrong GPT type: $EFI_PARTITION" || return 1
-  [[ $crypt_type == ca7d7ccb-63ed-4c53-861c-1742536059cc ]] \
-    || verification_error "LUKS partition has the wrong GPT type: $CRYPT_PARTITION" || return 1
-  [[ $(blkid --output value --match-tag TYPE "$EFI_PARTITION") == vfat ]] \
-    || verification_error "EFI partition is not FAT: $EFI_PARTITION" || return 1
-
-  cryptsetup isLuks "$CRYPT_PARTITION" >/dev/null 2>&1 \
-    || verification_error "partition is not a LUKS container: $CRYPT_PARTITION" || return 1
-  luks_version=$(cryptsetup luksDump "$CRYPT_PARTITION" 2>/dev/null | awk -F: '$1 ~ /^[[:space:]]*Version$/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')
-  [[ $luks_version == 2 ]] \
-    || verification_error "LUKS container is not LUKS2: $CRYPT_PARTITION" || return 1
-  [[ -b /dev/mapper/$LUKS_NAME ]] \
-    || verification_error "LUKS mapper is missing: /dev/mapper/$LUKS_NAME" || return 1
-  mapper_device=$(cryptsetup status "$LUKS_NAME" 2>/dev/null | awk 'tolower($1) == "device:" { print $2; exit }')
-  [[ -n $mapper_device && $(readlink -f -- "$mapper_device") == $(readlink -f -- "$CRYPT_PARTITION") ]] \
-    || verification_error "LUKS mapper does not use the intended partition: /dev/mapper/$LUKS_NAME" || return 1
-
-  filesystem_type=$(blkid --output value --match-tag TYPE "/dev/mapper/$LUKS_NAME" || true)
-  label=$(blkid --output value --match-tag LABEL "/dev/mapper/$LUKS_NAME" || true)
-  [[ $filesystem_type == btrfs ]] \
-    || verification_error "mapper does not contain Btrfs: /dev/mapper/$LUKS_NAME" || return 1
-  [[ $label == "$BTRFS_LABEL" ]] \
-    || verification_error "Btrfs label is not $BTRFS_LABEL" || return 1
-  for subvolume in "$ROOT_SUBVOL" "$HOME_SUBVOL"; do
-    btrfs subvolume list "$MOUNT_ROOT" | awk -v expected="$subvolume" '
-      / path / { sub(/^.* path /, ""); if ($0 == expected) found = 1 }
-      END { exit !found }
-    ' || verification_error "Btrfs subvolume is missing: $subvolume" || return 1
-  done
-
-  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"; do
-    mountpoint -q "$mountpoint" \
-      || verification_error "expected mount is missing: $mountpoint" || return 1
-  done
-  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
-    mount_source=$(findmnt --noheadings --output SOURCE --target "$mountpoint")
-    mount_fstype=$(findmnt --noheadings --output FSTYPE --target "$mountpoint")
-    # Btrfs reports a mounted subvolume as /device[/subvolume].  The suffix is
-    # mount metadata, not part of the backing mapper path.
-    mount_source=${mount_source%%\[*}
-    [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "/dev/mapper/$LUKS_NAME") && $mount_fstype == btrfs ]] \
-      || verification_error "Btrfs mount has the wrong source or type: $mountpoint" || return 1
-  done
-  mount_uses_subvolume "$MOUNT_ROOT" "$ROOT_SUBVOL" \
-    || verification_error "root mount does not use subvolume $ROOT_SUBVOL: $MOUNT_ROOT" || return 1
-  mount_uses_subvolume "$MOUNT_ROOT/home" "$HOME_SUBVOL" \
-    || verification_error "home mount does not use subvolume $HOME_SUBVOL: $MOUNT_ROOT/home" || return 1
-  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
-    mount_has_option "$mountpoint" noatime \
-      || verification_error "Btrfs mount is missing noatime: $mountpoint" || return 1
-    mount_has_option "$mountpoint" compress=zstd:1 \
-      || verification_error "Btrfs mount is missing compress=zstd:1: $mountpoint" || return 1
-  done
-  mount_source=$(findmnt --noheadings --output SOURCE --target "$MOUNT_ROOT/efi")
-  mount_fstype=$(findmnt --noheadings --output FSTYPE --target "$MOUNT_ROOT/efi")
-  [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "$EFI_PARTITION") && $mount_fstype == vfat ]] \
-    || verification_error "EFI mount has the wrong source or type: $MOUNT_ROOT/efi" || return 1
-}
-
-confirm_phase() {
-  local phase=$1 answer
-
-  (( ASSUME_YES )) && return 0
-  [[ -r /dev/tty && -w /dev/tty ]] || die "a terminal is required to confirm $phase; use --yes only when appropriate"
-  printf '\nContinue with %s? [y/N] ' "$phase" >/dev/tty
-  IFS= read -r answer </dev/tty || die "could not read confirmation for $phase"
-  case $answer in
-    y|Y|yes|YES|Yes) return 0 ;;
-    *)
-      printf 'Stopped before %s.\n' "$phase"
-      exit 0
-      ;;
-  esac
-}
+# Command-line selection and configuration
 
 is_selected() {
   local wanted=$1 phase
@@ -312,6 +202,204 @@ parse_args() {
     shift
   done
 }
+
+# Runtime interaction
+
+confirm_phase() {
+  local phase=$1 answer
+
+  (( ASSUME_YES )) && return 0
+  [[ -r /dev/tty && -w /dev/tty ]] || die "a terminal is required to confirm $phase; use --yes only when appropriate"
+  printf '\nContinue with %s? [y/N] ' "$phase" >/dev/tty
+  IFS= read -r answer </dev/tty || die "could not read confirmation for $phase"
+  case $answer in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *)
+      printf 'Stopped before %s.\n' "$phase"
+      exit 0
+      ;;
+  esac
+}
+
+# Disk setup verification
+
+verification_error() {
+  printf 'error: disk setup verification failed: %s\n' "$*" >&2
+  return 1
+}
+
+mount_has_option() {
+  local mountpoint=$1 expected_option=$2 options option
+
+  options=$(run_privileged findmnt --noheadings --output OPTIONS --target "$mountpoint") || return 1
+  IFS=, read -r -a options <<<"$options"
+  for option in "${options[@]}"; do
+    [[ $option == "$expected_option" ]] && return 0
+  done
+  return 1
+}
+
+mount_uses_subvolume() {
+  local mountpoint=$1 expected_subvolume=$2
+
+  mount_has_option "$mountpoint" "subvol=$expected_subvolume" \
+    || mount_has_option "$mountpoint" "subvol=/$expected_subvolume"
+}
+
+verify_disk_setup() {
+  # This is a production gate: disk setup calls it before allowing later
+  # installer phases to use the prepared filesystem.
+  local efi_type crypt_type mapper_device luks_version filesystem_type label
+  local mount_source mount_fstype target_disk_name subvolume
+
+  # 1. Check the inspection tools first so a missing tool is reported as a
+  # verification failure, rather than being mistaken for a malformed layout.
+  for command in lsblk readlink awk cryptsetup blkid btrfs findmnt mountpoint; do
+    command -v "$command" >/dev/null 2>&1 \
+      || verification_error "required command is unavailable: $command" || return 1
+  done
+
+  # 2. Confirm that the chosen disk has the intended GPT and that both
+  # partition paths resolve to direct children of that exact disk.
+  [[ $(run_privileged lsblk --noheadings --output PTTYPE "$TARGET_DISK" | awk 'NR == 1 { print tolower($1) }') == gpt ]] \
+    || verification_error "target does not have a GPT partition table: $TARGET_DISK" || return 1
+  target_disk_name=${TARGET_DISK##*/}
+  [[ $(run_privileged lsblk --noheadings --output PKNAME "$EFI_PARTITION" | awk 'NR == 1 { print $1 }') == "$target_disk_name" ]] \
+    || verification_error "EFI partition is not on the target disk: $EFI_PARTITION" || return 1
+  [[ $(run_privileged lsblk --noheadings --output PKNAME "$CRYPT_PARTITION" | awk 'NR == 1 { print $1 }') == "$target_disk_name" ]] \
+    || verification_error "LUKS partition is not on the target disk: $CRYPT_PARTITION" || return 1
+
+  # 3. Confirm the EFI and encrypted partition types, plus the FAT filesystem
+  # firmware needs on the unencrypted EFI System Partition.
+  efi_type=$(run_privileged lsblk --noheadings --output PARTTYPE "$EFI_PARTITION" | awk 'NR == 1 { print tolower($1) }')
+  crypt_type=$(run_privileged lsblk --noheadings --output PARTTYPE "$CRYPT_PARTITION" | awk 'NR == 1 { print tolower($1) }')
+  [[ $efi_type == c12a7328-f81f-11d2-ba4b-00a0c93ec93b ]] \
+    || verification_error "EFI partition has the wrong GPT type: $EFI_PARTITION" || return 1
+  [[ $crypt_type == ca7d7ccb-63ed-4c53-861c-1742536059cc ]] \
+    || verification_error "LUKS partition has the wrong GPT type: $CRYPT_PARTITION" || return 1
+  [[ $(run_privileged blkid --output value --match-tag TYPE "$EFI_PARTITION") == vfat ]] \
+    || verification_error "EFI partition is not FAT: $EFI_PARTITION" || return 1
+
+  # 4. Confirm the partition is LUKS2 and the open mapper points back to it.
+  run_privileged cryptsetup isLuks "$CRYPT_PARTITION" >/dev/null 2>&1 \
+    || verification_error "partition is not a LUKS container: $CRYPT_PARTITION" || return 1
+  luks_version=$(run_privileged cryptsetup luksDump "$CRYPT_PARTITION" 2>/dev/null | awk -F: '$1 ~ /^[[:space:]]*Version$/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')
+  [[ $luks_version == 2 ]] \
+    || verification_error "LUKS container is not LUKS2: $CRYPT_PARTITION" || return 1
+  [[ -b /dev/mapper/$LUKS_NAME ]] \
+    || verification_error "LUKS mapper is missing: /dev/mapper/$LUKS_NAME" || return 1
+  mapper_device=$(run_privileged cryptsetup status "$LUKS_NAME" 2>/dev/null | awk 'tolower($1) == "device:" { print $2; exit }')
+  [[ -n $mapper_device && $(readlink -f -- "$mapper_device") == $(readlink -f -- "$CRYPT_PARTITION") ]] \
+    || verification_error "LUKS mapper does not use the intended partition: /dev/mapper/$LUKS_NAME" || return 1
+
+  # 5. Confirm the mapper contains the labeled Btrfs filesystem and the two
+  # named subvolumes used by the following installation phases.
+  filesystem_type=$(run_privileged blkid --output value --match-tag TYPE "/dev/mapper/$LUKS_NAME" || true)
+  label=$(run_privileged blkid --output value --match-tag LABEL "/dev/mapper/$LUKS_NAME" || true)
+  [[ $filesystem_type == btrfs ]] \
+    || verification_error "mapper does not contain Btrfs: /dev/mapper/$LUKS_NAME" || return 1
+  [[ $label == "$BTRFS_LABEL" ]] \
+    || verification_error "Btrfs label is not $BTRFS_LABEL" || return 1
+  for subvolume in "$ROOT_SUBVOL" "$HOME_SUBVOL"; do
+    run_privileged btrfs subvolume list "$MOUNT_ROOT" | awk -v expected="$subvolume" '
+      / path / { sub(/^.* path /, ""); if ($0 == expected) found = 1 }
+      END { exit !found }
+    ' || verification_error "Btrfs subvolume is missing: $subvolume" || return 1
+  done
+
+  # 6. Confirm all three mounts exist before checking their sources, types,
+  # subvolumes, and mount options individually.
+  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"; do
+    run_privileged mountpoint -q "$mountpoint" \
+      || verification_error "expected mount is missing: $mountpoint" || return 1
+  done
+  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
+    mount_source=$(run_privileged findmnt --noheadings --output SOURCE --target "$mountpoint")
+    mount_fstype=$(run_privileged findmnt --noheadings --output FSTYPE --target "$mountpoint")
+    # Btrfs reports a mounted subvolume as /device[/subvolume].  The suffix is
+    # mount metadata, not part of the backing mapper path.
+    mount_source=${mount_source%%\[*}
+    [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "/dev/mapper/$LUKS_NAME") && $mount_fstype == btrfs ]] \
+      || verification_error "Btrfs mount has the wrong source or type: $mountpoint" || return 1
+  done
+  mount_uses_subvolume "$MOUNT_ROOT" "$ROOT_SUBVOL" \
+    || verification_error "root mount does not use subvolume $ROOT_SUBVOL: $MOUNT_ROOT" || return 1
+  mount_uses_subvolume "$MOUNT_ROOT/home" "$HOME_SUBVOL" \
+    || verification_error "home mount does not use subvolume $HOME_SUBVOL: $MOUNT_ROOT/home" || return 1
+  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
+    mount_has_option "$mountpoint" noatime \
+      || verification_error "Btrfs mount is missing noatime: $mountpoint" || return 1
+    mount_has_option "$mountpoint" compress=zstd:1 \
+      || verification_error "Btrfs mount is missing compress=zstd:1: $mountpoint" || return 1
+  done
+  # 7. Finally, ensure the firmware-visible mount still comes from the EFI
+  # partition, rather than from the encrypted Btrfs filesystem.
+  mount_source=$(run_privileged findmnt --noheadings --output SOURCE --target "$MOUNT_ROOT/efi")
+  mount_fstype=$(run_privileged findmnt --noheadings --output FSTYPE --target "$MOUNT_ROOT/efi")
+  [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "$EFI_PARTITION") && $mount_fstype == vfat ]] \
+    || verification_error "EFI mount has the wrong source or type: $MOUNT_ROOT/efi" || return 1
+}
+
+# Disk setup presentation, input, and recovery
+
+print_plan() {
+  cat <<EOF
+
+Installation disk plan
+  $TARGET_DISK
+  ├─ $EFI_PARTITION: EFI System Partition, FAT32, $EFI_SIZE → $MOUNT_ROOT/efi
+  └─ $CRYPT_PARTITION: LUKS2 → /dev/mapper/$LUKS_NAME
+     └─ Btrfs ($BTRFS_LABEL)
+        ├─ $ROOT_SUBVOL → $MOUNT_ROOT
+        └─ $HOME_SUBVOL → $MOUNT_ROOT/home
+
+This will irreversibly erase every existing partition and filesystem on
+$TARGET_DISK.  Dry-run mode changes nothing.
+EOF
+}
+
+confirm_target() {
+  # Read /dev/tty rather than stdin so this still works when the installer
+  # arrived through `curl ... | bash`; stdin is the script body in that case.
+  [[ $ASSUME_YES == 1 ]] && return 0
+  local answer
+  printf '\nType the exact target disk to erase (%s): ' "$TARGET_DISK" >/dev/tty
+  IFS= read -r answer </dev/tty || die 'could not read destructive-action confirmation from the terminal'
+  [[ $answer == "$TARGET_DISK" ]] || die 'target confirmation did not match; no changes made'
+}
+
+prompt_luks_passphrase() {
+  # Keep the passphrase out of argv, exports, shell history, and files.  It is
+  # piped directly to cryptsetup below and then removed from shell state.
+  local first second
+  [[ -r /dev/tty && -w /dev/tty ]] || die 'cannot securely prompt for a LUKS passphrase without a terminal'
+  printf 'New LUKS passphrase: ' >/dev/tty
+  IFS= read -r -s first </dev/tty || die 'could not read LUKS passphrase'
+  printf '\nConfirm LUKS passphrase: ' >/dev/tty
+  IFS= read -r -s second </dev/tty || die 'could not read LUKS passphrase confirmation'
+  printf '\n' >/dev/tty
+  [[ -n $first ]] || die 'empty LUKS passphrases are not accepted'
+  [[ $first == "$second" ]] || die 'LUKS passphrases did not match'
+  LUKS_PASSPHRASE=$first
+  unset first second
+}
+
+cleanup_after_failure() {
+  # Reverse only mounts and the mapper created by this run.  A partition table
+  # or LUKS header cannot be safely "undone" after disk setup is confirmed.
+  local exit_code=${1:-$?}
+  (( exit_code == 0 )) && return
+  set +e
+  if (( MOUNTED_EFI )); then run_privileged umount "$MOUNT_ROOT/efi"; fi
+  if (( MOUNTED_HOME )); then run_privileged umount "$MOUNT_ROOT/home"; fi
+  if (( MOUNTED_ROOT )); then run_privileged umount "$MOUNT_ROOT"; fi
+  if (( LUKS_OPENED )); then run_privileged cryptsetup close "$LUKS_NAME"; fi
+  unset LUKS_PASSPHRASE 2>/dev/null || true
+  printf 'error: disk setup did not complete; mounts created by this run were cleaned up.\n' >&2
+  exit "$exit_code"
+}
+
+# Disk setup phase
 
 disk_setup() {
   local command value mountpoint source backing_disk
@@ -480,7 +568,7 @@ EOF
     for command in sgdisk wipefs partprobe udevadm mkfs.fat cryptsetup mkfs.btrfs btrfs mount umount mountpoint blkid; do
       require_command "$command"
     done
-    [[ $EUID -eq 0 ]] || die 'disk setup must run as root'
+    (( EUID == 0 )) || require_command sudo
     ! mountpoint -q "$MOUNT_ROOT" || die "mount root is already mounted: $MOUNT_ROOT"
   fi
 
@@ -495,51 +583,63 @@ EOF
 
   confirm_phase 'disk setup'
   confirm_target
+  if (( EUID != 0 )); then
+    [[ -r /dev/tty && -w /dev/tty ]] || die 'a terminal is required to authorize disk setup with sudo'
+    cat <<EOF
+
+Disk setup will now use sudo to:
+  * erase and repartition $TARGET_DISK;
+  * create and open the LUKS2 container as /dev/mapper/$LUKS_NAME;
+  * create the Btrfs filesystem and subvolumes; and
+  * mount the prepared root, home, and EFI filesystems below $MOUNT_ROOT.
+EOF
+    sudo -v || die 'sudo authorization failed; no disk changes made'
+  fi
   prompt_luks_passphrase
   trap cleanup_after_failure ERR
 
   # Erase old signatures and both GPT copies, then create a fresh GPT.  Ask the
   # kernel to reread it and wait for the new partition devices before formatting.
   log "Erasing partition and filesystem signatures on $TARGET_DISK"
-  wipefs --all --force "$TARGET_DISK"
-  sgdisk --zap-all "$TARGET_DISK"
-  sgdisk --clear \
+  run_privileged wipefs --all --force "$TARGET_DISK"
+  run_privileged sgdisk --zap-all "$TARGET_DISK"
+  run_privileged sgdisk --clear \
     --new=1:0:+"$EFI_SIZE" --typecode=1:ef00 --change-name=1:EFI \
     --new=2:0:0 --typecode=2:8309 --change-name=2:cryptroot \
     "$TARGET_DISK"
-  partprobe "$TARGET_DISK"
-  udevadm settle
+  run_privileged partprobe "$TARGET_DISK"
+  run_privileged udevadm settle
 
   [[ -b $EFI_PARTITION && -b $CRYPT_PARTITION ]] || die 'partition devices did not appear after partitioning'
   # The ESP is FAT32 because firmware consumes it before Linux is running.
   # Its label is informational and does not participate in root mounting.
-  mkfs.fat --fat 32 --name EFI "$EFI_PARTITION"
+  run_privileged mkfs.fat --fat 32 --name EFI "$EFI_PARTITION"
 
   log "Creating and opening LUKS2 container as $LUKS_NAME"
-  printf '%s' "$LUKS_PASSPHRASE" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$CRYPT_PARTITION"
-  printf '%s' "$LUKS_PASSPHRASE" | cryptsetup open --key-file=- "$CRYPT_PARTITION" "$LUKS_NAME"
+  printf '%s' "$LUKS_PASSPHRASE" | run_privileged cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$CRYPT_PARTITION"
+  printf '%s' "$LUKS_PASSPHRASE" | run_privileged cryptsetup open --key-file=- "$CRYPT_PARTITION" "$LUKS_NAME"
   unset LUKS_PASSPHRASE
   LUKS_OPENED=1
 
   # Mount Btrfs top-level ID 5 only long enough to create the intended install
   # subvolumes.  Never extract the stage3 while this staging mount is active.
-  mkfs.btrfs --force --label "$BTRFS_LABEL" --data single --metadata dup "/dev/mapper/$LUKS_NAME"
-  mkdir -p "$MOUNT_ROOT"
-  mount -o subvolid=5 "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT"
+  run_privileged mkfs.btrfs --force --label "$BTRFS_LABEL" --data single --metadata dup "/dev/mapper/$LUKS_NAME"
+  run_privileged mkdir -p "$MOUNT_ROOT"
+  run_privileged mount -o subvolid=5 "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT"
   MOUNTED_ROOT=1
-  btrfs subvolume create "$MOUNT_ROOT/$ROOT_SUBVOL"
-  btrfs subvolume create "$MOUNT_ROOT/$HOME_SUBVOL"
-  umount "$MOUNT_ROOT"
+  run_privileged btrfs subvolume create "$MOUNT_ROOT/$ROOT_SUBVOL"
+  run_privileged btrfs subvolume create "$MOUNT_ROOT/$HOME_SUBVOL"
+  run_privileged umount "$MOUNT_ROOT"
   MOUNTED_ROOT=0
 
   # These are the root/home options later expected in fstab.  Named subvolumes,
   # rather than numeric IDs, keep recovery commands and fstab auditable.
-  mount -o "subvol=$ROOT_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT"
+  run_privileged mount -o "subvol=$ROOT_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT"
   MOUNTED_ROOT=1
-  mkdir -p "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"
-  mount -o "subvol=$HOME_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT/home"
+  run_privileged mkdir -p "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"
+  run_privileged mount -o "subvol=$HOME_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT/home"
   MOUNTED_HOME=1
-  mount "$EFI_PARTITION" "$MOUNT_ROOT/efi"
+  run_privileged mount "$EFI_PARTITION" "$MOUNT_ROOT/efi"
   MOUNTED_EFI=1
 
   if ! verify_disk_setup; then
@@ -549,70 +649,13 @@ EOF
   trap - ERR
 
   log 'Disk setup complete'
-  findmnt -R "$MOUNT_ROOT"
+  run_privileged findmnt -R "$MOUNT_ROOT"
   cat <<EOF
 
 The encrypted filesystem remains open at /dev/mapper/$LUKS_NAME and mounted at
 $MOUNT_ROOT for the next installer phase.  The passphrase has been discarded
 from this script's shell state.
 EOF
-}
-
-print_plan() {
-  cat <<EOF
-
-Installation disk plan
-  $TARGET_DISK
-  ├─ $EFI_PARTITION: EFI System Partition, FAT32, $EFI_SIZE → $MOUNT_ROOT/efi
-  └─ $CRYPT_PARTITION: LUKS2 → /dev/mapper/$LUKS_NAME
-     └─ Btrfs ($BTRFS_LABEL)
-        ├─ $ROOT_SUBVOL → $MOUNT_ROOT
-        └─ $HOME_SUBVOL → $MOUNT_ROOT/home
-
-This will irreversibly erase every existing partition and filesystem on
-$TARGET_DISK.  Dry-run mode changes nothing.
-EOF
-}
-
-confirm_target() {
-  # Read /dev/tty rather than stdin so this still works when the installer
-  # arrived through `curl ... | bash`; stdin is the script body in that case.
-  [[ $ASSUME_YES == 1 ]] && return 0
-  local answer
-  printf '\nType the exact target disk to erase (%s): ' "$TARGET_DISK" >/dev/tty
-  IFS= read -r answer </dev/tty || die 'could not read destructive-action confirmation from the terminal'
-  [[ $answer == "$TARGET_DISK" ]] || die 'target confirmation did not match; no changes made'
-}
-
-prompt_luks_passphrase() {
-  # Keep the passphrase out of argv, exports, shell history, and files.  It is
-  # piped directly to cryptsetup below and then removed from shell state.
-  local first second
-  [[ -r /dev/tty && -w /dev/tty ]] || die 'cannot securely prompt for a LUKS passphrase without a terminal'
-  printf 'New LUKS passphrase: ' >/dev/tty
-  IFS= read -r -s first </dev/tty || die 'could not read LUKS passphrase'
-  printf '\nConfirm LUKS passphrase: ' >/dev/tty
-  IFS= read -r -s second </dev/tty || die 'could not read LUKS passphrase confirmation'
-  printf '\n' >/dev/tty
-  [[ -n $first ]] || die 'empty LUKS passphrases are not accepted'
-  [[ $first == "$second" ]] || die 'LUKS passphrases did not match'
-  LUKS_PASSPHRASE=$first
-  unset first second
-}
-
-cleanup_after_failure() {
-  # Reverse only mounts and the mapper created by this run.  A partition table
-  # or LUKS header cannot be safely "undone" after disk setup is confirmed.
-  local exit_code=${1:-$?}
-  (( exit_code == 0 )) && return
-  set +e
-  if (( MOUNTED_EFI )); then umount "$MOUNT_ROOT/efi"; fi
-  if (( MOUNTED_HOME )); then umount "$MOUNT_ROOT/home"; fi
-  if (( MOUNTED_ROOT )); then umount "$MOUNT_ROOT"; fi
-  if (( LUKS_OPENED )); then cryptsetup close "$LUKS_NAME"; fi
-  unset LUKS_PASSPHRASE 2>/dev/null || true
-  printf 'error: disk setup did not complete; mounts created by this run were cleaned up.\n' >&2
-  exit "$exit_code"
 }
 
 main() {
