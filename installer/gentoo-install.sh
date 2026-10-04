@@ -120,9 +120,8 @@ mount_uses_subvolume() {
 }
 
 verify_disk_setup() {
-  # This is deliberately a production check rather than an assertion embedded
-  # in the setup commands.  QEMU integration tests can source this script and
-  # call it against a real prepared disk without duplicating the checks.
+  # This is a production gate: disk setup calls it before allowing later
+  # installer phases to use the prepared filesystem.
   local efi_type crypt_type mapper_device luks_version filesystem_type label
   local mount_source mount_fstype target_disk_name subvolume
 
@@ -309,14 +308,41 @@ Disk setup: target protection, layout, and mount mechanics
 The installer accepts one whole block device and derives its partitions.  For
 example, /dev/nvme0n1 becomes /dev/nvme0n1p1 and /dev/nvme0n1p2.
 
+Optional manual safety checks
+-----------------------------
+
 The target must have lsblk type `disk`; partitions, /dev/mapper entries, and
 ordinary paths are rejected.  The script then protects disks backing /, /boot,
 /efi, or /boot/efi, as well as mounted or active-swap descendants.
+
+lsblk --paths --output NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS /dev/nvme0n1
+findmnt --target /
+findmnt --target /boot
+findmnt --target /efi
+findmnt --target /boot/efi
+swapon --show
+test ! -e /dev/mapper/cryptroot
+
+Erase and partition the disk
+----------------------------
 
 The target receives a GPT containing two partitions: a FAT32 EFI System
 Partition (default 1 GiB, GPT type EF00) and a LUKS2 container using the
 remainder (type 8309).  The ESP stays outside LUKS because UEFI firmware must
 read the later boot image before Linux can decrypt the root filesystem.
+
+wipefs --all --force /dev/nvme0n1
+sgdisk --zap-all /dev/nvme0n1
+sgdisk --clear \
+  --new=1:0:+1G --typecode=1:ef00 --change-name=1:EFI \
+  --new=2:0:0 --typecode=2:8309 --change-name=2:cryptroot \
+  /dev/nvme0n1
+
+partprobe /dev/nvme0n1
+udevadm settle
+
+Create the EFI, LUKS, and Btrfs layers
+---------------------------------------
 
 The LUKS partition opens as /dev/mapper/<luks-name>.  Btrfs is formatted there,
 not on the raw partition, so the filesystem, subvolume metadata, and later
@@ -324,11 +350,28 @@ Gentoo files are encrypted.  `--data single` is appropriate for one device;
 `--metadata dup` retains two metadata copies on that device and is standard
 practice as recommended by upstream.
 
+mkfs.fat --fat 32 --name EFI /dev/nvme0n1p1
+cryptsetup luksFormat --type luks2 /dev/nvme0n1p2
+cryptsetup open /dev/nvme0n1p2 cryptroot
+mkfs.btrfs --force --label GENTOO --data single --metadata dup /dev/mapper/cryptroot
+
+Create the root and home subvolumes
+-----------------------------------
+
 The fresh Btrfs top level, normally subvolume ID 5, is mounted temporarily only
 to create @ and @home.  The stage3 must later be unpacked after @ is remounted
 as <mount-root>.  @home is mounted separately at <mount-root>/home so system
 snapshots can exclude home by default.  Named `subvol=@` paths are simpler to
 inspect in fstab and recovery commands than numeric IDs.
+
+mkdir -p /mnt/gentoo
+mount -o subvolid=5 /dev/mapper/cryptroot /mnt/gentoo
+btrfs subvolume create /mnt/gentoo/@
+btrfs subvolume create /mnt/gentoo/@home
+umount /mnt/gentoo
+
+Mount the layout for the next phase
+-----------------------------------
 
 `noatime,compress=zstd:1` is a conservative initial root/home mount policy
 to start.  Do not add `ssd` or `space_cache=v2`: modern Btrfs handles those
@@ -336,8 +379,20 @@ automatically.  Do not globally enable autodefrag, nodatacow, nodatasum, or
 compress-force without a workload-specific reason; they can harm snapshot or
 integrity behavior.
 
+mount -o subvol=@,noatime,compress=zstd:1 /dev/mapper/cryptroot /mnt/gentoo
+mkdir -p /mnt/gentoo/home /mnt/gentoo/efi
+mount -o subvol=@home,noatime,compress=zstd:1 /dev/mapper/cryptroot /mnt/gentoo/home
+mount /dev/nvme0n1p1 /mnt/gentoo/efi
+
+Optional manual verification
+----------------------------
+
 The printed lsblk table and layout plan are the checks to read before applying
 the plan.
+
+cryptsetup isLuks /dev/nvme0n1p2
+btrfs subvolume list /mnt/gentoo
+findmnt -R /mnt/gentoo
 EOF
   fi
 
@@ -551,6 +606,4 @@ main() {
   fi
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  main "$@"
-fi
+main "$@"
