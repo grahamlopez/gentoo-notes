@@ -309,7 +309,7 @@ verify_disk_setup() {
 
   # 6. Confirm all three mounts exist before checking their sources, types,
   # subvolumes, and mount options individually.
-  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"; do
+  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home" "$MOUNT_ROOT/boot"; do
     run_privileged mountpoint -q "$mountpoint" \
       || verification_error "expected mount is missing: $mountpoint" || return 1
   done
@@ -334,10 +334,10 @@ verify_disk_setup() {
   done
   # 7. Finally, ensure the firmware-visible mount still comes from the EFI
   # partition, rather than from the encrypted Btrfs filesystem.
-  mount_source=$(run_privileged findmnt --noheadings --output SOURCE --target "$MOUNT_ROOT/efi")
-  mount_fstype=$(run_privileged findmnt --noheadings --output FSTYPE --target "$MOUNT_ROOT/efi")
+  mount_source=$(run_privileged findmnt --noheadings --output SOURCE --target "$MOUNT_ROOT/boot")
+  mount_fstype=$(run_privileged findmnt --noheadings --output FSTYPE --target "$MOUNT_ROOT/boot")
   [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "$EFI_PARTITION") && $mount_fstype == vfat ]] \
-    || verification_error "EFI mount has the wrong source or type: $MOUNT_ROOT/efi" || return 1
+    || verification_error "EFI mount has the wrong source or type: $MOUNT_ROOT/boot" || return 1
 }
 
 # Disk setup presentation, input, and recovery
@@ -347,7 +347,7 @@ print_plan() {
 
 Installation disk plan
   $TARGET_DISK
-  ├─ $EFI_PARTITION: EFI System Partition, FAT32, $EFI_SIZE → $MOUNT_ROOT/efi
+  ├─ $EFI_PARTITION: EFI System Partition, FAT32, $EFI_SIZE → $MOUNT_ROOT/boot
   └─ $CRYPT_PARTITION: LUKS2 → /dev/mapper/$LUKS_NAME
      └─ Btrfs ($BTRFS_LABEL)
         ├─ $ROOT_SUBVOL → $MOUNT_ROOT
@@ -390,12 +390,12 @@ cleanup_after_failure() {
   local exit_code=${1:-$?}
   (( exit_code == 0 )) && return
   set +e
-  if (( MOUNTED_EFI )); then run_privileged umount "$MOUNT_ROOT/efi"; fi
+  if (( MOUNTED_EFI )); then run_privileged umount "$MOUNT_ROOT/boot"; fi
   if (( MOUNTED_HOME )); then run_privileged umount "$MOUNT_ROOT/home"; fi
   if (( MOUNTED_ROOT )); then run_privileged umount "$MOUNT_ROOT"; fi
   if (( LUKS_OPENED )); then run_privileged cryptsetup close "$LUKS_NAME"; fi
   unset LUKS_PASSPHRASE 2>/dev/null || true
-  printf 'error: disk setup did not complete; mounts created by this run were cleaned up.\n' >&2
+  printf 'error: disk setup did not complete; any mounts created by this run were cleaned up.\n' >&2
   exit "$exit_code"
 }
 
@@ -436,11 +436,11 @@ remainder (type 8309).  The ESP stays outside LUKS because UEFI firmware must
 read the later boot image before Linux can decrypt the root filesystem.
 
 wipefs --all --force /dev/nvme0n1
-sgdisk --zap-all /dev/nvme0n1
-sgdisk --clear \
-  --new=1:0:+1G --typecode=1:ef00 --change-name=1:EFI \
-  --new=2:0:0 --typecode=2:8309 --change-name=2:cryptroot \
-  /dev/nvme0n1
+sfdisk --wipe always --wipe-partitions always /dev/nvme0n1 <<'EOF'
+label: gpt
+size=1G, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI"
+type=CA7D7CCB-63ED-4C53-861C-1742536059CC, name="cryptroot"
+EOF
 
 partprobe /dev/nvme0n1
 udevadm settle
@@ -454,7 +454,7 @@ Gentoo files are encrypted.  `--data single` is appropriate for one device;
 `--metadata dup` retains two metadata copies on that device and is standard
 practice as recommended by upstream.
 
-mkfs.fat --fat 32 --name EFI /dev/nvme0n1p1
+mkfs.fat -F 32 -n EFI /dev/nvme0n1p1
 cryptsetup luksFormat --type luks2 /dev/nvme0n1p2
 cryptsetup open /dev/nvme0n1p2 cryptroot
 mkfs.btrfs --force --label GENTOO --data single --metadata dup /dev/mapper/cryptroot
@@ -483,10 +483,15 @@ automatically.  Do not globally enable autodefrag, nodatacow, nodatasum, or
 compress-force without a workload-specific reason; they can harm snapshot or
 integrity behavior.
 
+The ESP mounts at <mount-root>/boot, where its EFI directory becomes /boot/EFI
+inside the installed system.  Later UKIs will live there for direct firmware
+booting.
+
 mount -o subvol=@,noatime,compress=zstd:1 /dev/mapper/cryptroot /mnt/gentoo
-mkdir -p /mnt/gentoo/home /mnt/gentoo/efi
+mkdir -p /mnt/gentoo/home /mnt/gentoo/boot
 mount -o subvol=@home,noatime,compress=zstd:1 /dev/mapper/cryptroot /mnt/gentoo/home
-mount /dev/nvme0n1p1 /mnt/gentoo/efi
+mount /dev/nvme0n1p1 /mnt/gentoo/boot
+mkdir -p /mnt/gentoo/boot/EFI
 
 Optional manual verification
 ----------------------------
@@ -565,7 +570,7 @@ EOF
 
   [[ ! -e /dev/mapper/$LUKS_NAME ]] || die "LUKS mapper already exists: /dev/mapper/$LUKS_NAME"
   if [[ $MODE == apply ]]; then
-    for command in sgdisk wipefs partprobe udevadm mkfs.fat cryptsetup mkfs.btrfs btrfs mount umount mountpoint blkid; do
+    for command in sfdisk wipefs partprobe udevadm mkfs.fat cryptsetup mkfs.btrfs btrfs mount umount mountpoint blkid; do
       require_command "$command"
     done
     (( EUID == 0 )) || require_command sudo
@@ -598,22 +603,23 @@ EOF
   prompt_luks_passphrase
   trap cleanup_after_failure ERR
 
-  # Erase old signatures and both GPT copies, then create a fresh GPT.  Ask the
-  # kernel to reread it and wait for the new partition devices before formatting.
+  # Clear visible old signatures, then pass an explicit GPT layout to sfdisk.
+  # sfdisk also wipes signatures that fall within the new partitions.  Ask the
+  # kernel to reread the new table before formatting its partition devices.
   log "Erasing partition and filesystem signatures on $TARGET_DISK"
   run_privileged wipefs --all --force "$TARGET_DISK"
-  run_privileged sgdisk --zap-all "$TARGET_DISK"
-  run_privileged sgdisk --clear \
-    --new=1:0:+"$EFI_SIZE" --typecode=1:ef00 --change-name=1:EFI \
-    --new=2:0:0 --typecode=2:8309 --change-name=2:cryptroot \
-    "$TARGET_DISK"
+  run_privileged sfdisk --wipe always --wipe-partitions always "$TARGET_DISK" <<EOF
+label: gpt
+size=$EFI_SIZE, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI"
+type=CA7D7CCB-63ED-4C53-861C-1742536059CC, name="cryptroot"
+EOF
   run_privileged partprobe "$TARGET_DISK"
   run_privileged udevadm settle
 
   [[ -b $EFI_PARTITION && -b $CRYPT_PARTITION ]] || die 'partition devices did not appear after partitioning'
   # The ESP is FAT32 because firmware consumes it before Linux is running.
   # Its label is informational and does not participate in root mounting.
-  run_privileged mkfs.fat --fat 32 --name EFI "$EFI_PARTITION"
+  run_privileged mkfs.fat -F 32 -n EFI "$EFI_PARTITION"
 
   log "Creating and opening LUKS2 container as $LUKS_NAME"
   printf '%s' "$LUKS_PASSPHRASE" | run_privileged cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$CRYPT_PARTITION"
@@ -636,11 +642,12 @@ EOF
   # rather than numeric IDs, keep recovery commands and fstab auditable.
   run_privileged mount -o "subvol=$ROOT_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT"
   MOUNTED_ROOT=1
-  run_privileged mkdir -p "$MOUNT_ROOT/home" "$MOUNT_ROOT/efi"
+  run_privileged mkdir -p "$MOUNT_ROOT/home" "$MOUNT_ROOT/boot"
   run_privileged mount -o "subvol=$HOME_SUBVOL,noatime,compress=zstd:1" "/dev/mapper/$LUKS_NAME" "$MOUNT_ROOT/home"
   MOUNTED_HOME=1
-  run_privileged mount "$EFI_PARTITION" "$MOUNT_ROOT/efi"
+  run_privileged mount "$EFI_PARTITION" "$MOUNT_ROOT/boot"
   MOUNTED_EFI=1
+  run_privileged mkdir -p "$MOUNT_ROOT/boot/EFI"
 
   if ! verify_disk_setup; then
     printf 'error: disk setup verification failed; stopping before later phases.\n' >&2
