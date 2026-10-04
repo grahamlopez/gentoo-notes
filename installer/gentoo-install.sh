@@ -108,15 +108,22 @@ verification_error() {
   return 1
 }
 
-mount_uses_subvolume() {
-  local mountpoint=$1 expected_subvolume=$2 options option
+mount_has_option() {
+  local mountpoint=$1 expected_option=$2 options option
 
   options=$(findmnt --noheadings --output OPTIONS --target "$mountpoint") || return 1
   IFS=, read -r -a options <<<"$options"
   for option in "${options[@]}"; do
-    [[ $option == "subvol=$expected_subvolume" || $option == "subvol=/$expected_subvolume" ]] && return 0
+    [[ $option == "$expected_option" ]] && return 0
   done
   return 1
+}
+
+mount_uses_subvolume() {
+  local mountpoint=$1 expected_subvolume=$2
+
+  mount_has_option "$mountpoint" "subvol=$expected_subvolume" \
+    || mount_has_option "$mountpoint" "subvol=/$expected_subvolume"
 }
 
 verify_disk_setup() {
@@ -158,8 +165,8 @@ verify_disk_setup() {
   [[ -n $mapper_device && $(readlink -f -- "$mapper_device") == $(readlink -f -- "$CRYPT_PARTITION") ]] \
     || verification_error "LUKS mapper does not use the intended partition: /dev/mapper/$LUKS_NAME" || return 1
 
-  filesystem_type=$(blkid --output value --match-tag TYPE "/dev/mapper/$LUKS_NAME")
-  label=$(blkid --output value --match-tag LABEL "/dev/mapper/$LUKS_NAME")
+  filesystem_type=$(blkid --output value --match-tag TYPE "/dev/mapper/$LUKS_NAME" || true)
+  label=$(blkid --output value --match-tag LABEL "/dev/mapper/$LUKS_NAME" || true)
   [[ $filesystem_type == btrfs ]] \
     || verification_error "mapper does not contain Btrfs: /dev/mapper/$LUKS_NAME" || return 1
   [[ $label == "$BTRFS_LABEL" ]] \
@@ -178,6 +185,9 @@ verify_disk_setup() {
   for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
     mount_source=$(findmnt --noheadings --output SOURCE --target "$mountpoint")
     mount_fstype=$(findmnt --noheadings --output FSTYPE --target "$mountpoint")
+    # Btrfs reports a mounted subvolume as /device[/subvolume].  The suffix is
+    # mount metadata, not part of the backing mapper path.
+    mount_source=${mount_source%%\[*}
     [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "/dev/mapper/$LUKS_NAME") && $mount_fstype == btrfs ]] \
       || verification_error "Btrfs mount has the wrong source or type: $mountpoint" || return 1
   done
@@ -185,6 +195,12 @@ verify_disk_setup() {
     || verification_error "root mount does not use subvolume $ROOT_SUBVOL: $MOUNT_ROOT" || return 1
   mount_uses_subvolume "$MOUNT_ROOT/home" "$HOME_SUBVOL" \
     || verification_error "home mount does not use subvolume $HOME_SUBVOL: $MOUNT_ROOT/home" || return 1
+  for mountpoint in "$MOUNT_ROOT" "$MOUNT_ROOT/home"; do
+    mount_has_option "$mountpoint" noatime \
+      || verification_error "Btrfs mount is missing noatime: $mountpoint" || return 1
+    mount_has_option "$mountpoint" compress=zstd:1 \
+      || verification_error "Btrfs mount is missing compress=zstd:1: $mountpoint" || return 1
+  done
   mount_source=$(findmnt --noheadings --output SOURCE --target "$MOUNT_ROOT/efi")
   mount_fstype=$(findmnt --noheadings --output FSTYPE --target "$MOUNT_ROOT/efi")
   [[ $(readlink -f -- "$mount_source") == $(readlink -f -- "$EFI_PARTITION") && $mount_fstype == vfat ]] \
