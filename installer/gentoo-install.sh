@@ -7,17 +7,18 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns three phases:
+# This installer currently owns four phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
 #   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
 #   systemd stage3, extract it, and prepare a chroot environment.
 #   portage-foundation: install the live configuration work tree, configure
 #   Portage for Git synchronization, and establish locale and timezone.
+#   system-update: establish CPU policy, update @world, and review configuration.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
-# Later phases will update the system, build the kernel, and install the UKI.
+# Later phases will build the kernel and install the UKI.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
   printf 'error: this installer requires Bash.\n' >&2
@@ -55,9 +56,11 @@ TARGET_TIMEZONE=${TARGET_TIMEZONE:-$DEFAULT_TIMEZONE}
 TARGET_LOCALE=${TARGET_LOCALE:-$DEFAULT_LOCALE}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation)
+SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update)
 VERBOSE=0
 INTERNAL_PORTAGE_CHROOT=0
+INTERNAL_UPDATE_CHROOT=0
+TARGET_CPU_FLAGS=${TARGET_CPU_FLAGS:-}
 
 EFI_PARTITION=
 CRYPT_PARTITION=
@@ -66,7 +69,7 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation)
+PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update)
 
 usage() {
   cat <<EOF
@@ -74,7 +77,7 @@ Usage: $PROGRAM --disk DEVICE [options]
 
 Install the selected Gentoo phases.  The current milestone prepares an
 encrypted Btrfs disk, bootstraps the verified stage3, and establishes the
-target's Portage configuration.
+target's Portage configuration, then updates the base system.
 
 Required:
   --disk DEVICE              Whole block device to erase, for example /dev/nvme0n1
@@ -87,7 +90,7 @@ Options:
   --verbose                  Print technical notes and detailed phase output.
                               It does not affect execution or confirmations.
   --phase NAME               Run a named phase (currently: disk-setup,
-                              stage3-bootstrap, portage-foundation). May be
+                              stage3-bootstrap, portage-foundation, system-update). May be
                               repeated; phases run in installer order.
   --config-source SOURCE     Public Git URL or local repository path
                               (default: $CONFIG_SOURCE).
@@ -95,6 +98,8 @@ Options:
                               (default: $CONFIG_BRANCH).
   --target-host NAME         Configuration target: generic, qemu, or thinktop
                               (default: $TARGET_HOST).
+  --cpu-flags FLAGS          Explicit CPU_FLAGS_X86 flags for another target;
+                              otherwise detect the running CPU.
   --timezone ZONE            Target timezone (default: $TARGET_TIMEZONE).
   --locale LOCALE            Target UTF-8 locale (default: $TARGET_LOCALE).
   --luks-name NAME           Mapper name after opening LUKS (default: $LUKS_NAME).
@@ -108,7 +113,7 @@ Options:
 
 Environment overrides mirror these options: TARGET_DISK, LUKS_NAME,
 BTRFS_LABEL, ROOT_SUBVOL, HOME_SUBVOL, EFI_SIZE, MOUNT_ROOT, CONFIG_SOURCE,
-CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, and TARGET_LOCALE.
+CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, TARGET_LOCALE, and TARGET_CPU_FLAGS.
 
 Safety model:
   * Selected phases run by default; --dry-run is the non-destructive mode.
@@ -254,6 +259,13 @@ parse_args() {
         shift
         ;;
       --locale=*) TARGET_LOCALE=${1#*=} ;;
+      --cpu-flags)
+        (($# >= 2)) || die '--cpu-flags requires a flag list'
+        TARGET_CPU_FLAGS=$2
+        shift
+        ;;
+      --cpu-flags=*) TARGET_CPU_FLAGS=${1#*=} ;;
+      --internal-update-chroot) INTERNAL_UPDATE_CHROOT=1 ;;
       --internal-portage-chroot) INTERNAL_PORTAGE_CHROOT=1 ;;
       -h|--help)
         usage
@@ -1107,7 +1119,7 @@ EOF
 }
 
 install_portage_foundation() {
-  local command source config_git_dir config_revision signature_status
+  local command source config_git_dir config_revision signature_status planned_profile
 
   if (( VERBOSE )); then
     cat <<'EOF'
@@ -1177,18 +1189,34 @@ EOF
   esac
 
   if [[ $MODE == dry-run ]]; then
-    cat <<EOF
+    planned_profile='existing AMD64 desktop/systemd profile (verified during execution)'
+  else
+    require_command chroot
+    (( EUID == 0 )) || require_command sudo
+    [[ -x $MOUNT_ROOT/bin/bash && -r $MOUNT_ROOT/etc/gentoo-release ]] \
+      || die 'portage-foundation requires an extracted Gentoo stage3'
+    # The stage3 profile symlink exists before its repository is populated.
+    # Read its target without resolving the not-yet-installed profiles tree.
+    planned_profile=$(run_privileged readlink "$MOUNT_ROOT/etc/portage/make.profile")
+    planned_profile=${planned_profile##*/profiles/}
+    [[ -n $planned_profile ]] || die 'stage3 profile link is missing'
+  fi
+  cat <<EOF
 
 Portage foundation plan
+Configuration target: $TARGET_HOST
+Gentoo profile:       $planned_profile
+Timezone:             $TARGET_TIMEZONE
+Locale:               $TARGET_LOCALE
+
   * install configuration branch $CONFIG_BRANCH from $CONFIG_SOURCE;
   * select the common plus $TARGET_HOST Portage layers;
-  * clone and authenticate the Gentoo Git repository from the installation host;
-  * verify the existing AMD64 desktop/systemd profile;
-  * configure timezone $TARGET_TIMEZONE and locale $TARGET_LOCALE; and
+  * clone and authenticate the Gentoo Git repository;
+  * verify the existing profile and configure timezone and locale; and
   * stop before the initial @world update.
-
-Dry run: no repository, chroot, or target configuration changes made.
 EOF
+  if [[ $MODE == dry-run ]]; then
+    printf '\nDry run: no repository, chroot, or target configuration changes made.\n'
     return 0
   fi
 
@@ -1269,8 +1297,201 @@ The bare configuration repository is stored at
 EOF
 }
 
+
+# System update: reconcile the stage3 with the configured target policy.
+# Upstream references:
+# https://wiki.gentoo.org/wiki/Handbook:AMD64/Installation/Base
+# https://wiki.gentoo.org/wiki/CPU_FLAGS_*
+# https://wiki.gentoo.org/wiki/Dispatch-conf
+# https://wiki.gentoo.org/wiki/Upgrading_Gentoo
+
+pending_config_updates() {
+  local protect path
+  local -a paths
+  protect=$(portageq envvar CONFIG_PROTECT)
+  IFS=' ' read -r -a paths <<<"$protect"
+  for path in "${paths[@]}"; do
+    [[ -d $path ]] || continue
+    find "$path" -type f -name '._cfg????_*' -print
+  done
+}
+
+system_update_chroot() {
+  local flags pending archive_dir
+  (( EUID == 0 )) || die 'the internal system update must run as root'
+  [[ -r /etc/gentoo-release && -d /var/lib/gentoo-config/repository.git ]] \
+    || die 'system-update requires the Gentoo target and configuration repository'
+  [[ -r /etc/portage/make.conf.d/90-$TARGET_HOST ]] \
+    || die 'the selected target configuration is missing'
+  valid_target_host "$TARGET_HOST" || die 'unsupported system-update target'
+  grep -Fxq "GENTOO_TARGET_HOST=\"$TARGET_HOST\"" /etc/gentoo-config/target-host \
+    || die 'system-update target differs from the installed Portage foundation'
+  require_command emerge
+  require_command portageq
+  require_command eselect
+  require_command dispatch-conf
+  require_command emaint
+  if [[ -n $TARGET_CPU_FLAGS ]]; then
+    [[ $TARGET_CPU_FLAGS =~ ^[a-z0-9_]+([[:blank:]][a-z0-9_]+)*$ ]] || die 'invalid CPU flag list'
+  fi
+  portageq envvar COMMON_FLAGS >/dev/null
+  # Explicitly disable binary consumption even if inherited configuration enables it.
+  emerge --oneshot --noreplace --usepkg=n --getbinpkg=n dev-vcs/git app-portage/cpuid2cpuflags
+  emaint --auto sync
+  # news list can return 1 after successfully listing items; read displays titles too.
+  eselect news read
+  emerge --oneshot --usepkg=n --getbinpkg=n sys-apps/portage
+
+  flags=$TARGET_CPU_FLAGS
+  if [[ -z $flags ]]; then
+    flags=$(cpuid2cpuflags)
+    [[ $flags == 'CPU_FLAGS_X86: '* ]] || die 'CPU detection did not return CPU_FLAGS_X86'
+    flags=${flags#CPU_FLAGS_X86: }
+  fi
+  [[ $flags =~ ^[a-z0-9_]+([[:blank:]][a-z0-9_]+)*$ ]] || die 'invalid CPU flag list'
+  install -d /etc/portage/package.use
+  printf '*/* cpu_flags_x86: %s\n' "$flags" >/etc/portage/package.use/00cpu-flags
+  printf 'Target CPU flags: %s\n' "$flags"
+  emerge --pretend --verbose --update --deep --newuse --usepkg=n --getbinpkg=n @world
+  confirm_phase 'initial world update (review relevant news above)'
+  emerge --verbose --update --deep --newuse --usepkg=n --getbinpkg=n @world
+
+  pending=$(pending_config_updates)
+  if [[ -n $pending ]]; then
+    printf '\nConfiguration updates awaiting review:\n%s\n' "$pending"
+    [[ -r /dev/tty && -w /dev/tty ]] \
+      || die 'configuration review requires a terminal; rerun system-update interactively'
+    # Read the archive setting as data, never source the configuration as shell code.
+    archive_dir=$(sed -n 's/^[[:space:]]*archive-dir[[:space:]]*=[[:space:]]*//p' /etc/dispatch-conf.conf | tail -n 1)
+    archive_dir=${archive_dir:-/etc/config-archive}
+    [[ $archive_dir == /* ]] || die 'dispatch-conf archive-dir must be absolute'
+    install -d -m 700 "$archive_dir"
+    dispatch-conf </dev/tty >/dev/tty 2>&1
+    pending=$(pending_config_updates)
+    [[ -z $pending ]] || die "configuration updates remain unresolved: $pending"
+  fi
+  emerge --verbose --usepkg=n --getbinpkg=n @preserved-rebuild
+  pending=$(pending_config_updates)
+  [[ -z $pending ]] || die "rebuilds left configuration updates requiring review: $pending"
+  git --git-dir=/var/lib/gentoo-config/repository.git --work-tree=/ --no-pager diff --stat
+  printf '\nReview configuration changes with: gentoo-config diff\n'
+  printf 'CPU policy is stored in /etc/portage/package.use/00cpu-flags.\n'
+  printf 'No dependency cleanup is performed in this phase.\n'
+}
+
+install_system_update() {
+  local source status=0
+  log 'Phase: system-update'
+  if (( VERBOSE )); then
+    cat <<'EOF'
+System update: reconcile the base system with target policy
+==========================================================
+
+Install tools and synchronize repositories
+------------------------------------------
+
+Install target-side Git and CPU detection tools from source, synchronize
+repositories, and read Gentoo news before approving the initial world update.
+
+emerge --oneshot --noreplace --usepkg=n --getbinpkg=n dev-vcs/git app-portage/cpuid2cpuflags
+emaint --auto sync
+eselect news read
+emerge --oneshot --usepkg=n --getbinpkg=n sys-apps/portage
+
+Update Portage first so the world update uses the current package manager.
+
+Establish target CPU policy
+---------------------------
+
+CPU flags default to the running machine. When preparing another machine,
+provide --cpu-flags with that machine's supported flags. QEMU must expose the
+same features (the runbook uses -cpu host). The detected or supplied flags are
+written to /etc/portage/package.use/00cpu-flags before updating @world.
+Compilation settings are inherited unchanged from the configuration files.
+
+cpuid2cpuflags
+printf '*/* cpu_flags_x86: %s\n' "$flags" >/etc/portage/package.use/00cpu-flags
+
+Review and update the base system
+---------------------------------
+
+Show the proposed package changes and ask before proceeding with the update.
+
+emerge --pretend --verbose --update --deep --newuse --usepkg=n --getbinpkg=n @world
+emerge --verbose --update --deep --newuse --usepkg=n --getbinpkg=n @world
+
+Review configuration and rebuild consumers
+------------------------------------------
+
+When protected configuration updates exist, prepare the archive directory
+specified in /etc/dispatch-conf.conf and review updates with dispatch-conf.
+Unresolved updates stop the phase. --yes does not answer merge choices.
+Then rebuild preserved-library consumers and show tracked configuration changes.
+
+install -d -m 700 "$archive_dir"
+dispatch-conf
+emerge --verbose --usepkg=n --getbinpkg=n @preserved-rebuild
+git --git-dir=/var/lib/gentoo-config/repository.git --work-tree=/ --no-pager diff --stat
+gentoo-config diff
+
+This phase stops before kernel installation and does not clean dependencies.
+A failed update leaves the target mounted so this phase can be resumed.
+EOF
+  fi
+  cat <<EOF
+
+System update plan
+Target root:          $MOUNT_ROOT
+Configuration target: $TARGET_HOST
+CPU flags:            ${TARGET_CPU_FLAGS:-detect from the running machine}
+
+  * install Git and CPU detection tools, synchronize repositories, and read news;
+  * save target CPU flags and review the proposed @world update;
+  * ask before updating packages with the existing compilation settings;
+  * review pending configuration updates interactively with dispatch-conf; and
+  * rebuild preserved-library consumers and show configuration changes.
+EOF
+  if [[ $MODE == dry-run ]]; then
+    printf '\nDry run: no packages, CPU policy, or configuration files changed.\n'
+    return
+  fi
+  require_command chroot
+  require_command mountpoint
+  (( EUID == 0 )) || require_command sudo
+  [[ -n $TARGET_DISK ]] || die 'system-update requires --disk DEVICE'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  [[ -b $TARGET_DISK ]] || die "target is not a block device: $TARGET_DISK"
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+  verify_disk_setup || die 'system-update requires a verified disk layout'
+  [[ -r $MOUNT_ROOT/etc/gentoo-release ]] || die 'the Gentoo target is missing'
+  for source in proc sys dev run; do
+    mountpoint -q "$MOUNT_ROOT/$source" || die "required chroot mount is missing: $source"
+  done
+  confirm_phase 'system update'
+  # Preserve the mounted target on failure so builds and merges can be resumed.
+  local internal_script=/run/$PROGRAM.update.$$
+  local -a update_options=()
+  (( ASSUME_YES == 0 )) || update_options+=(--yes)
+  run_privileged install -m 700 "$0" "$MOUNT_ROOT$internal_script"
+  run_privileged chroot "$MOUNT_ROOT" /usr/bin/env -i \
+    HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TERM="${TERM:-dumb}" /bin/bash "$internal_script" \
+    --internal-update-chroot --target-host "$TARGET_HOST" \
+    --cpu-flags "$TARGET_CPU_FLAGS" "${update_options[@]}" || status=$?
+  run_privileged rm -f -- "$MOUNT_ROOT$internal_script"
+  (( status == 0 )) || die 'system-update did not complete; target remains mounted for review and retry'
+  log 'System update complete: ready for kernel installation'
+}
+
 main() {
   parse_args "$@"
+  if (( INTERNAL_UPDATE_CHROOT )); then
+    system_update_chroot
+    return
+  fi
   if (( INTERNAL_PORTAGE_CHROOT )); then
     portage_foundation_chroot
     return
@@ -1283,6 +1504,9 @@ main() {
   fi
   if is_selected portage-foundation; then
     install_portage_foundation
+  fi
+  if is_selected system-update; then
+    install_system_update
   fi
 }
 

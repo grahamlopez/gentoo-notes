@@ -110,6 +110,21 @@ sudo chroot /mnt/gentoo /bin/bash -c \
   'grep -Fxq '\''GENTOO_TARGET_HOST="qemu"'\'' /etc/gentoo-config/target-host && [[ -d /var/db/repos/gentoo/.git ]]'
 ```
 
+The default installer now also runs `system-update`. CPU detection occurs on
+the installation host; the VM boot command below uses `-cpu host` to expose
+those same features. Configuration updates are reviewed interactively with
+`dispatch-conf`, including when `--yes` is used. Compilation settings come from
+the existing configuration repository.
+
+If the update fails, the target remains mounted. Resume only that phase:
+
+```bash
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --phase system-update --verbose
+sudo chroot /mnt/gentoo gentoo-config diff
+sudo chroot /mnt/gentoo cat /etc/portage/package.use/00cpu-flags
+```
+
 ## Detach and preserve the target for later work
 
 ```bash
