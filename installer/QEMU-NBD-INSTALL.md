@@ -11,7 +11,7 @@ running these instructions is the production path.
 ## Host tools
 
 ```bash
-sudo pacman -S --needed qemu-base btrfs-progs cryptsetup curl dosfstools gnupg
+sudo pacman -S --needed qemu-base btrfs-progs cryptsetup curl dosfstools git gnupg
 ```
 
 ## Set up this install shell
@@ -22,10 +22,13 @@ Paste this once into the terminal that will run the install commands:
 INSTALL_DIR=/home/graham/VMs/agentic-gentoo
 IMAGE=$INSTALL_DIR/target.qcow2
 NBD_DEVICE=/dev/nbd0
+CONFIG_SOURCE=/home/graham/Projects/gentoo-configs
+CONFIG_BRANCH=agentic-gentoo
 
 detach_target() {
   local nbd_pid_file=/sys/block/${NBD_DEVICE##*/}/pid
   local nbd_pid
+  local attempt
 
   if mountpoint -q /mnt/gentoo/run; then sudo umount --recursive /mnt/gentoo/run; fi
   if mountpoint -q /mnt/gentoo/dev; then sudo umount --recursive /mnt/gentoo/dev; fi
@@ -39,6 +42,24 @@ detach_target() {
     nbd_pid=$(<"$nbd_pid_file")
     if [[ -n $nbd_pid && $nbd_pid != 0 ]]; then
       sudo qemu-nbd --disconnect "$NBD_DEVICE"
+      for attempt in {1..50}; do
+        [[ ! -r $nbd_pid_file ]] && break
+        nbd_pid=$(<"$nbd_pid_file")
+        [[ -z $nbd_pid || $nbd_pid == 0 ]] && break
+        sleep 0.1
+      done
+      [[ ! -r $nbd_pid_file || -z $nbd_pid || $nbd_pid == 0 ]] || {
+        printf 'NBD device did not finish disconnecting: %s\n' "$NBD_DEVICE" >&2
+        return 1
+      }
+      for attempt in {1..50}; do
+        qemu-img info "$IMAGE" >/dev/null 2>&1 && break
+        sleep 0.1
+      done
+      qemu-img info "$IMAGE" >/dev/null 2>&1 || {
+        printf 'Image write lock was not released: %s\n' "$IMAGE" >&2
+        return 1
+      }
     fi
   fi
 }
@@ -74,13 +95,19 @@ attach_target
 
 ```bash
 cd /home/graham/Projects/gentoo-notes
-./installer/gentoo-install.sh --disk "$NBD_DEVICE" --dry-run --verbose
-./installer/gentoo-install.sh --disk "$NBD_DEVICE" --verbose
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --config-source "$CONFIG_SOURCE" --config-branch "$CONFIG_BRANCH" \
+  --target-host qemu --dry-run --verbose
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --config-source "$CONFIG_SOURCE" --config-branch "$CONFIG_BRANCH" \
+  --target-host qemu --verbose
 
 sudo findmnt -R /mnt/gentoo
 sudo bash -c '[[ -r /mnt/gentoo/etc/gentoo-release ]]'
 sudo chroot /mnt/gentoo /bin/bash -c \
   '[[ -r /proc/cpuinfo && -c /dev/null && -d /sys && -r /etc/resolv.conf ]]'
+sudo chroot /mnt/gentoo /bin/bash -c \
+  'grep -Fxq '\''GENTOO_TARGET_HOST="qemu"'\'' /etc/gentoo-config/target-host && [[ -d /var/db/repos/gentoo/.git ]]'
 ```
 
 ## Detach and preserve the target for later work

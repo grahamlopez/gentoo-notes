@@ -7,15 +7,17 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns two phases:
+# This installer currently owns three phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
 #   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
 #   systemd stage3, extract it, and prepare a chroot environment.
+#   portage-foundation: install the live configuration work tree, configure
+#   Portage for Git synchronization, and establish locale and timezone.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
-# Later phases will configure Portage, build the kernel, and install the UKI.
+# Later phases will update the system, build the kernel, and install the UKI.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
   printf 'error: this installer requires Bash.\n' >&2
@@ -31,6 +33,13 @@ readonly STAGE3_BASE_URL='https://distfiles.gentoo.org/releases/amd64/autobuilds
 readonly STAGE3_LATEST_MANIFEST='latest-stage3-amd64-desktop-systemd.txt'
 readonly GENTOO_RELEASE_KEYS_URL='https://dev.gentoo.org/~sam/dist/sec-keys/openpgp-keys-gentoo-release/gentoo-release.asc.20260125.gz'
 readonly GENTOO_AUTOMATED_RELEASE_FINGERPRINT='13EBBDBEDE7A12775DFDB1BABB572E0E2D182910'
+readonly GENTOO_REPOSITORY_URL='https://github.com/gentoo-mirror/gentoo.git'
+readonly GENTOO_REPOSITORY_SIGNING_FINGERPRINT='EF9538C9E8E64311A52CDEDFA13D0EF1914E7A72'
+readonly DEFAULT_CONFIG_SOURCE='https://github.com/grahamlopez/gentoo-configs.git'
+readonly DEFAULT_CONFIG_BRANCH='main'
+readonly DEFAULT_TARGET_HOST='generic'
+readonly DEFAULT_TIMEZONE='America/New_York'
+readonly DEFAULT_LOCALE='en_US.UTF-8'
 
 TARGET_DISK=${TARGET_DISK:-}
 LUKS_NAME=${LUKS_NAME:-cryptroot}
@@ -39,10 +48,16 @@ ROOT_SUBVOL=${ROOT_SUBVOL:-@}
 HOME_SUBVOL=${HOME_SUBVOL:-@home}
 EFI_SIZE=${EFI_SIZE:-$DEFAULT_EFI_SIZE}
 MOUNT_ROOT=${MOUNT_ROOT:-/mnt/gentoo}
+CONFIG_SOURCE=${CONFIG_SOURCE:-$DEFAULT_CONFIG_SOURCE}
+CONFIG_BRANCH=${CONFIG_BRANCH:-$DEFAULT_CONFIG_BRANCH}
+TARGET_HOST=${TARGET_HOST:-$DEFAULT_TARGET_HOST}
+TARGET_TIMEZONE=${TARGET_TIMEZONE:-$DEFAULT_TIMEZONE}
+TARGET_LOCALE=${TARGET_LOCALE:-$DEFAULT_LOCALE}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup stage3-bootstrap)
+SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation)
 VERBOSE=0
+INTERNAL_PORTAGE_CHROOT=0
 
 EFI_PARTITION=
 CRYPT_PARTITION=
@@ -51,15 +66,15 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup stage3-bootstrap)
+PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation)
 
 usage() {
   cat <<EOF
 Usage: $PROGRAM --disk DEVICE [options]
 
 Install the selected Gentoo phases.  The current milestone prepares an
-encrypted Btrfs disk and bootstraps the verified stage3; later milestones add
-the remaining system configuration.
+encrypted Btrfs disk, bootstraps the verified stage3, and establishes the
+target's Portage configuration.
 
 Required:
   --disk DEVICE              Whole block device to erase, for example /dev/nvme0n1
@@ -72,8 +87,16 @@ Options:
   --verbose                  Print technical notes and detailed phase output.
                               It does not affect execution or confirmations.
   --phase NAME               Run a named phase (currently: disk-setup,
-                              stage3-bootstrap). May be repeated; phases run
-                              in installer order.
+                              stage3-bootstrap, portage-foundation). May be
+                              repeated; phases run in installer order.
+  --config-source SOURCE     Public Git URL or local repository path
+                              (default: $CONFIG_SOURCE).
+  --config-branch BRANCH     Configuration branch to install
+                              (default: $CONFIG_BRANCH).
+  --target-host NAME         Configuration target: generic, qemu, or thinktop
+                              (default: $TARGET_HOST).
+  --timezone ZONE            Target timezone (default: $TARGET_TIMEZONE).
+  --locale LOCALE            Target UTF-8 locale (default: $TARGET_LOCALE).
   --luks-name NAME           Mapper name after opening LUKS (default: $LUKS_NAME).
   --btrfs-label LABEL        Btrfs volume label (default: $BTRFS_LABEL).
   --root-subvol NAME         Root Btrfs subvolume (default: $ROOT_SUBVOL).
@@ -84,7 +107,8 @@ Options:
   -h, --help                 Show this help.
 
 Environment overrides mirror these options: TARGET_DISK, LUKS_NAME,
-BTRFS_LABEL, ROOT_SUBVOL, HOME_SUBVOL, EFI_SIZE, and MOUNT_ROOT.
+BTRFS_LABEL, ROOT_SUBVOL, HOME_SUBVOL, EFI_SIZE, MOUNT_ROOT, CONFIG_SOURCE,
+CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, and TARGET_LOCALE.
 
 Safety model:
   * Selected phases run by default; --dry-run is the non-destructive mode.
@@ -200,6 +224,37 @@ parse_args() {
         shift
         ;;
       --mount-root=*) MOUNT_ROOT=${1#*=} ;;
+      --config-source)
+        (($# >= 2)) || die '--config-source requires a URL or path'
+        CONFIG_SOURCE=$2
+        shift
+        ;;
+      --config-source=*) CONFIG_SOURCE=${1#*=} ;;
+      --config-branch)
+        (($# >= 2)) || die '--config-branch requires a branch name'
+        CONFIG_BRANCH=$2
+        shift
+        ;;
+      --config-branch=*) CONFIG_BRANCH=${1#*=} ;;
+      --target-host)
+        (($# >= 2)) || die '--target-host requires a name'
+        TARGET_HOST=$2
+        shift
+        ;;
+      --target-host=*) TARGET_HOST=${1#*=} ;;
+      --timezone)
+        (($# >= 2)) || die '--timezone requires a zone name'
+        TARGET_TIMEZONE=$2
+        shift
+        ;;
+      --timezone=*) TARGET_TIMEZONE=${1#*=} ;;
+      --locale)
+        (($# >= 2)) || die '--locale requires a locale name'
+        TARGET_LOCALE=$2
+        shift
+        ;;
+      --locale=*) TARGET_LOCALE=${1#*=} ;;
+      --internal-portage-chroot) INTERNAL_PORTAGE_CHROOT=1 ;;
       -h|--help)
         usage
         exit 0
@@ -948,13 +1003,286 @@ DNS and /proc, /sys, /dev, and /run are mounted there for the next phase.
 EOF
 }
 
+# Portage foundation support
+
+valid_target_host() {
+  case $1 in
+    generic|qemu|thinktop) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cleanup_portage_foundation_failure() {
+  local exit_code=${1:-$?}
+  local mountpoint
+
+  (( exit_code == 0 )) && return
+  trap - ERR EXIT
+  set +e
+  [[ -n ${PORTAGE_INTERNAL_SCRIPT:-} ]] \
+    && run_privileged rm -f -- "$MOUNT_ROOT/run/$PORTAGE_INTERNAL_SCRIPT"
+  [[ -n ${PORTAGE_REPOSITORY_GPG_HOME:-} ]] \
+    && run_privileged rm -rf -- "$PORTAGE_REPOSITORY_GPG_HOME"
+  for mountpoint in "$MOUNT_ROOT/run" "$MOUNT_ROOT/dev" "$MOUNT_ROOT/sys" "$MOUNT_ROOT/proc"; do
+    run_privileged umount --recursive "$mountpoint" 2>/dev/null || true
+  done
+  run_privileged umount "$MOUNT_ROOT/boot" 2>/dev/null || true
+  run_privileged umount "$MOUNT_ROOT/home" 2>/dev/null || true
+  run_privileged umount "$MOUNT_ROOT" 2>/dev/null || true
+  if run_privileged cryptsetup status "$LUKS_NAME" >/dev/null 2>&1; then
+    run_privileged cryptsetup close "$LUKS_NAME" || true
+  fi
+  printf 'error: Portage foundation did not complete; chroot mounts and the LUKS mapper were cleaned up.\n' >&2
+  exit "$exit_code"
+}
+
+portage_foundation_chroot() {
+  local profile locale_choice normalized_locale available_locale
+
+  (( EUID == 0 )) || die 'the internal Portage phase must run as root'
+  [[ -r /etc/gentoo-release ]] || die 'the internal Portage phase is not running in a Gentoo target'
+  valid_target_host "$TARGET_HOST" || die "unsupported target host: $TARGET_HOST"
+  [[ -r /etc/portage/make.conf.d/90-$TARGET_HOST ]] \
+    || die "configuration repository does not provide target host: $TARGET_HOST"
+  [[ -r /usr/share/zoneinfo/$TARGET_TIMEZONE ]] \
+    || die "timezone is unavailable in the target: $TARGET_TIMEZONE"
+  [[ $TARGET_LOCALE =~ ^[A-Za-z][A-Za-z_]*\.(UTF-8|utf8)$ ]] \
+    || die "locale must be a UTF-8 locale such as en_US.UTF-8: $TARGET_LOCALE"
+
+  for command in eselect locale-gen portageq; do
+    require_command "$command"
+  done
+
+  # Verify that Portage can parse the common and selected native fragments
+  # before repository or locale state is changed.
+  portageq envvar COMMON_FLAGS >/dev/null \
+    || die 'Portage could not evaluate the installed make.conf layers'
+
+  [[ -d /var/db/repos/gentoo/.git ]] \
+    || die 'the installation host did not provide the Gentoo Git work tree'
+  portageq repos_config / | grep -Fq 'sync-type = git' \
+    || die 'Portage does not report Git synchronization for the Gentoo repository'
+  portageq repos_config / | grep -Fq 'sync-uri = https://github.com/gentoo-mirror/gentoo.git' \
+    || die 'Portage does not report the expected Gentoo Git synchronization endpoint'
+
+  profile=$(eselect profile show)
+  [[ $profile == *desktop/systemd* ]] \
+    || die "stage3 profile is not an AMD64 desktop/systemd profile: $profile"
+
+  ln -snf "../usr/share/zoneinfo/$TARGET_TIMEZONE" /etc/localtime
+  printf '%s\n' "$TARGET_TIMEZONE" >/etc/timezone
+  printf '%s UTF-8\n' "$TARGET_LOCALE" >/etc/locale.gen
+  locale-gen
+  locale_choice=${TARGET_LOCALE/UTF-8/utf8}
+  eselect locale set "$locale_choice"
+  env-update
+
+  normalized_locale=${TARGET_LOCALE,,}
+  normalized_locale=${normalized_locale//-/}
+  available_locale=0
+  while IFS= read -r locale_choice; do
+    locale_choice=${locale_choice,,}
+    locale_choice=${locale_choice//-/}
+    if [[ $locale_choice == "$normalized_locale" ]]; then
+      available_locale=1
+      break
+    fi
+  done < <(locale -a)
+  (( available_locale )) || die "generated locale is unavailable: $TARGET_LOCALE"
+  [[ $(readlink -f /etc/localtime) == "/usr/share/zoneinfo/$TARGET_TIMEZONE" ]] \
+    || die "timezone link does not resolve to $TARGET_TIMEZONE"
+
+  log 'Portage foundation complete'
+  cat <<EOF
+
+Configuration target: $TARGET_HOST
+Gentoo profile:       ${profile##*$'\n'}
+Timezone:             $TARGET_TIMEZONE
+Locale:               $TARGET_LOCALE
+
+The Gentoo ebuild repository now synchronizes through the official Git mirror.
+Target-side Git installation and the initial @world update remain intentionally
+deferred to the system-update phase.
+EOF
+}
+
+portage_foundation() {
+  local command source config_git_dir config_revision signature_status
+
+  if (( VERBOSE )); then
+    cat <<'EOF'
+Portage foundation: live configuration and Git synchronization
+================================================================
+
+The configuration repository is a bare Git database whose work tree is the
+installed system itself. Files below /etc and /usr/local are therefore both
+operational configuration and tracked files; no deployment copy or symlink
+farm separates edits from version control. Common Portage policy is loaded
+before the explicitly selected host fragment.
+
+Install the configuration work tree
+-----------------------------------
+
+mkdir -p /var/lib/gentoo-config
+git clone --bare --single-branch --branch main https://github.com/grahamlopez/gentoo-configs.git /var/lib/gentoo-config/repository.git
+git --git-dir=/var/lib/gentoo-config/repository.git config core.bare false
+git --git-dir=/var/lib/gentoo-config/repository.git config core.worktree /
+git --git-dir=/var/lib/gentoo-config/repository.git config status.showUntrackedFiles no
+git --git-dir=/var/lib/gentoo-config/repository.git --work-tree=/ checkout --force main
+printf '%s\n' 'GENTOO_TARGET_HOST="qemu"' >/etc/gentoo-config/target-host
+
+mkdir -p /mnt/gentoo/var/db/repos
+git clone --depth 1 https://github.com/gentoo-mirror/gentoo.git /mnt/gentoo/var/db/repos/gentoo
+GNUPGHOME=/tmp/gentoo-repository-keys
+mkdir -m 700 "$GNUPGHOME"
+gpg --homedir "$GNUPGHOME" --import /mnt/gentoo/usr/share/openpgp-keys/gentoo-release.asc
+GNUPGHOME="$GNUPGHOME" git -C /mnt/gentoo/var/db/repos/gentoo verify-commit HEAD
+rm -rf "$GNUPGHOME"
+
+Configure the target from inside the chroot
+-------------------------------------------
+
+chroot /mnt/gentoo /bin/bash
+portageq repos_config /
+eselect profile show
+ln -snf ../usr/share/zoneinfo/America/New_York /etc/localtime
+printf '%s\n' America/New_York >/etc/timezone
+printf '%s UTF-8\n' en_US.UTF-8 >/etc/locale.gen
+locale-gen
+eselect locale set en_US.utf8
+env-update
+
+This phase validates the effective Portage configuration and repository but
+does not update @world. That update belongs after all common and host-specific
+policy is established.
+EOF
+  fi
+
+  log 'Phase: portage-foundation'
+
+  valid_target_host "$TARGET_HOST" || die "unsupported target host: $TARGET_HOST"
+  [[ -n $CONFIG_SOURCE && $CONFIG_SOURCE != *$'\n'* ]] || die 'configuration source must be a non-empty single line'
+  [[ -n $CONFIG_BRANCH && $CONFIG_BRANCH != -* && $CONFIG_BRANCH != *$'\n'* ]] \
+    || die 'configuration branch must be a non-empty branch name'
+  [[ $TARGET_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$ && $TARGET_TIMEZONE != *..* ]] \
+    || die "unsupported timezone syntax: $TARGET_TIMEZONE"
+  [[ $TARGET_LOCALE =~ ^[A-Za-z][A-Za-z_]*\.(UTF-8|utf8)$ ]] \
+    || die "locale must be a UTF-8 locale such as en_US.UTF-8: $TARGET_LOCALE"
+  [[ -n $TARGET_DISK ]] || die 'portage-foundation requires --disk DEVICE to verify the prepared layout'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  [[ -b $TARGET_DISK ]] || die "target is not a block device: $TARGET_DISK"
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+
+  if [[ $MODE == dry-run ]]; then
+    cat <<EOF
+
+Portage foundation plan
+  * install configuration branch $CONFIG_BRANCH from $CONFIG_SOURCE;
+  * select the common plus $TARGET_HOST Portage layers;
+  * clone and authenticate the Gentoo Git repository from the installation host;
+  * verify the existing AMD64 desktop/systemd profile;
+  * configure timezone $TARGET_TIMEZONE and locale $TARGET_LOCALE; and
+  * stop before the initial @world update.
+
+Dry run: no repository, chroot, or target configuration changes made.
+EOF
+    return 0
+  fi
+
+  for command in chroot git gpg install mktemp mountpoint readlink tee; do
+    require_command "$command"
+  done
+  git check-ref-format --branch "$CONFIG_BRANCH" >/dev/null \
+    || die "invalid configuration branch name: $CONFIG_BRANCH"
+  (( EUID == 0 )) || require_command sudo
+  if (( EUID != 0 )); then
+    sudo -v || die 'sudo authorization failed; no Portage configuration changes made'
+  fi
+  verify_disk_setup || die 'portage-foundation requires a verified disk-setup layout'
+  [[ -x $MOUNT_ROOT/bin/bash && -r $MOUNT_ROOT/etc/gentoo-release ]] \
+    || die 'portage-foundation requires an extracted Gentoo stage3'
+  for source in "$MOUNT_ROOT/proc" "$MOUNT_ROOT/sys" "$MOUNT_ROOT/dev" "$MOUNT_ROOT/run"; do
+    mountpoint -q "$source" || die "required chroot mount is missing: $source"
+  done
+  [[ ! -e $MOUNT_ROOT/var/lib/gentoo-config/repository.git ]] \
+    || die 'configuration repository already exists in the target; perform the normal full installer rerun'
+
+  confirm_phase 'Portage foundation'
+  trap 'cleanup_portage_foundation_failure $?' ERR EXIT
+
+  run_privileged install -d -m 755 "$MOUNT_ROOT/var/lib/gentoo-config"
+  run_privileged git clone --bare --single-branch --branch "$CONFIG_BRANCH" \
+    "$CONFIG_SOURCE" "$MOUNT_ROOT/var/lib/gentoo-config/repository.git"
+  config_git_dir=$MOUNT_ROOT/var/lib/gentoo-config/repository.git
+  run_privileged git --git-dir="$config_git_dir" config core.bare false
+  run_privileged git --git-dir="$config_git_dir" config core.worktree /
+  run_privileged git --git-dir="$config_git_dir" config status.showUntrackedFiles no
+  run_privileged git --git-dir="$config_git_dir" --work-tree="$MOUNT_ROOT" checkout --force "$CONFIG_BRANCH"
+  config_revision=$(run_privileged git --git-dir="$config_git_dir" rev-parse "$CONFIG_BRANCH^{commit}")
+
+  run_privileged install -d -m 755 "$MOUNT_ROOT/etc/gentoo-config"
+  printf 'GENTOO_TARGET_HOST="%s"\n' "$TARGET_HOST" \
+    | run_privileged tee "$MOUNT_ROOT/etc/gentoo-config/target-host" >/dev/null
+  printf '%s\n' "$CONFIG_SOURCE" | run_privileged tee "$MOUNT_ROOT/etc/gentoo-config/source" >/dev/null
+  printf '%s\n' "$CONFIG_BRANCH" | run_privileged tee "$MOUNT_ROOT/etc/gentoo-config/branch" >/dev/null
+  printf '%s\n' "$config_revision" | run_privileged tee "$MOUNT_ROOT/etc/gentoo-config/revision" >/dev/null
+
+  [[ -r $MOUNT_ROOT/usr/share/openpgp-keys/gentoo-release.asc ]] \
+    || die 'the stage3 does not provide the Gentoo release-key bundle'
+  run_privileged install -d -m 755 "$MOUNT_ROOT/var/db/repos"
+  run_privileged git clone --depth 1 "$GENTOO_REPOSITORY_URL" "$MOUNT_ROOT/var/db/repos/gentoo"
+  PORTAGE_REPOSITORY_GPG_HOME=$(run_privileged mktemp -d "$MOUNT_ROOT/.gentoo-repository-keys.XXXXXX")
+  run_privileged gpg --batch --homedir "$PORTAGE_REPOSITORY_GPG_HOME" --import \
+    "$MOUNT_ROOT/usr/share/openpgp-keys/gentoo-release.asc" >/dev/null
+  signature_status=$(run_privileged env GNUPGHOME="$PORTAGE_REPOSITORY_GPG_HOME" \
+    git -C "$MOUNT_ROOT/var/db/repos/gentoo" verify-commit --raw HEAD 2>&1) \
+    || die 'the Gentoo repository tip does not have a valid signature'
+  grep -Fq "$GENTOO_REPOSITORY_SIGNING_FINGERPRINT" <<<"$signature_status" \
+    || die 'the Gentoo repository tip was not signed by the pinned repository key'
+  run_privileged rm -rf -- "$PORTAGE_REPOSITORY_GPG_HOME"
+  unset PORTAGE_REPOSITORY_GPG_HOME
+
+  PORTAGE_INTERNAL_SCRIPT=$PROGRAM.portage.$$
+  run_privileged install -m 700 "$0" "$MOUNT_ROOT/run/$PORTAGE_INTERNAL_SCRIPT"
+  run_privileged chroot "$MOUNT_ROOT" /usr/bin/env -i \
+    HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TERM="${TERM:-dumb}" /bin/bash "/run/$PORTAGE_INTERNAL_SCRIPT" \
+    --internal-portage-chroot --target-host "$TARGET_HOST" \
+    --timezone "$TARGET_TIMEZONE" --locale "$TARGET_LOCALE"
+  run_privileged rm -f -- "$MOUNT_ROOT/run/$PORTAGE_INTERNAL_SCRIPT"
+  unset PORTAGE_INTERNAL_SCRIPT
+  trap - ERR EXIT
+
+  log 'Portage foundation installed'
+  cat <<EOF
+
+Configuration source:   $CONFIG_SOURCE
+Configuration branch:   $CONFIG_BRANCH
+Configuration revision: $config_revision
+Configuration target:   $TARGET_HOST
+
+The bare configuration repository is stored at
+/var/lib/gentoo-config/repository.git with / as its live work tree.
+EOF
+}
+
 main() {
   parse_args "$@"
+  if (( INTERNAL_PORTAGE_CHROOT )); then
+    portage_foundation_chroot
+    return
+  fi
   if is_selected disk-setup; then
     disk_setup
   fi
   if is_selected stage3-bootstrap; then
     stage3_bootstrap
+  fi
+  if is_selected portage-foundation; then
+    portage_foundation
   fi
 }
 
