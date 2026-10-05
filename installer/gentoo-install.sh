@@ -7,14 +7,15 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns one phase:
+# This installer currently owns two phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
+#   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
+#   systemd stage3, extract it, and prepare a chroot environment.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
-# Later phases will install the stage3,
-# configure Portage, build the kernel, and install the UKI.
+# Later phases will configure Portage, build the kernel, and install the UKI.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
   printf 'error: this installer requires Bash.\n' >&2
@@ -26,6 +27,10 @@ IFS=$'\n\t'
 
 readonly PROGRAM=${0##*/}
 readonly DEFAULT_EFI_SIZE='1G'
+readonly STAGE3_BASE_URL='https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-desktop-systemd'
+readonly STAGE3_LATEST_MANIFEST='latest-stage3-amd64-desktop-systemd.txt'
+readonly GENTOO_RELEASE_KEYS_URL='https://dev.gentoo.org/~sam/dist/sec-keys/openpgp-keys-gentoo-release/gentoo-release.asc.20260125.gz'
+readonly GENTOO_AUTOMATED_RELEASE_FINGERPRINT='13EBBDBEDE7A12775DFDB1BABB572E0E2D182910'
 
 TARGET_DISK=${TARGET_DISK:-}
 LUKS_NAME=${LUKS_NAME:-cryptroot}
@@ -36,7 +41,7 @@ EFI_SIZE=${EFI_SIZE:-$DEFAULT_EFI_SIZE}
 MOUNT_ROOT=${MOUNT_ROOT:-/mnt/gentoo}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup)
+SELECTED_PHASES=(disk-setup stage3-bootstrap)
 VERBOSE=0
 
 EFI_PARTITION=
@@ -46,14 +51,15 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup)
+PHASE_ORDER=(disk-setup stage3-bootstrap)
 
 usage() {
   cat <<EOF
 Usage: $PROGRAM --disk DEVICE [options]
 
 Install the selected Gentoo phases.  The current milestone prepares an
-encrypted Btrfs disk layout; later milestones will add the remaining install.
+encrypted Btrfs disk and bootstraps the verified stage3; later milestones add
+the remaining system configuration.
 
 Required:
   --disk DEVICE              Whole block device to erase, for example /dev/nvme0n1
@@ -65,8 +71,9 @@ Options:
                               supplies, skips, or infers secret input.
   --verbose                  Print technical notes and detailed phase output.
                               It does not affect execution or confirmations.
-  --phase NAME               Run a named phase (currently: disk-setup).
-                              May be repeated as later phases are added.
+  --phase NAME               Run a named phase (currently: disk-setup,
+                              stage3-bootstrap). May be repeated; phases run
+                              in installer order.
   --luks-name NAME           Mapper name after opening LUKS (default: $LUKS_NAME).
   --btrfs-label LABEL        Btrfs volume label (default: $BTRFS_LABEL).
   --root-subvol NAME         Root Btrfs subvolume (default: $ROOT_SUBVOL).
@@ -436,11 +443,11 @@ remainder (type 8309).  The ESP stays outside LUKS because UEFI firmware must
 read the later boot image before Linux can decrypt the root filesystem.
 
 wipefs --all --force /dev/nvme0n1
-sfdisk --wipe always --wipe-partitions always /dev/nvme0n1 <<'EOF'
+sfdisk --wipe always --wipe-partitions always /dev/nvme0n1 <<'SFDISK_LAYOUT'
 label: gpt
 size=1G, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI"
 type=CA7D7CCB-63ED-4C53-861C-1742536059CC, name="cryptroot"
-EOF
+SFDISK_LAYOUT
 
 partprobe /dev/nvme0n1
 udevadm settle
@@ -665,10 +672,289 @@ from this script's shell state.
 EOF
 }
 
+# Stage3 bootstrap support
+
+download_file() {
+  local url=$1 destination=$2
+
+  if command -v curl >/dev/null 2>&1; then
+    run_privileged curl --fail --location --proto '=https' --tlsv1.2 --output "$destination" "$url"
+  else
+    run_privileged wget --https-only --secure-protocol=TLSv1_2 --output-document="$destination" "$url"
+  fi
+}
+
+verify_pinned_release_signature() {
+  local signed_file=$1 verified_file=$2 status_output
+
+  # GnuPG reports the signing subkey and its primary key through VALIDSIG.
+  # A good signature alone is insufficient because the downloaded key bundle
+  # contains more than one public key; require Gentoo's pinned primary key.
+  # --decrypt handles a clear-signed file: it verifies its signature and
+  # writes only its authenticated plaintext to verified_file.  --verify alone
+  # checks the signature but deliberately does not extract that plaintext.
+  status_output=$(run_privileged gpg --batch --homedir "$STAGE_GPG_HOME" \
+    --status-fd=1 --output "$verified_file" --decrypt "$signed_file")
+  printf '%s\n' "$status_output" | awk -v expected="$GENTOO_AUTOMATED_RELEASE_FINGERPRINT" '
+    $1 == "[GNUPG:]" && $2 == "VALIDSIG" && toupper($12) == expected { found = 1 }
+    END { exit !found }
+  ' || die "signature is not made by Gentoo's pinned automated-release key: ${signed_file##*/}"
+}
+
+cleanup_stage3_bootstrap_failure() {
+  local exit_code=${1:-$?}
+
+  (( exit_code == 0 )) && return
+  trap - ERR EXIT
+  set +e
+  # These locations are made by mktemp in this invocation.  Leave the mounted
+  # install layout intact; a failed download or verification must not undo it.
+  [[ -n ${STAGE_WORKDIR:-} ]] && run_privileged rm -rf -- "$STAGE_WORKDIR"
+  for mountpoint in "$MOUNT_ROOT/run" "$MOUNT_ROOT/dev" "$MOUNT_ROOT/sys" "$MOUNT_ROOT/proc"; do
+    run_privileged umount --recursive "$mountpoint" 2>/dev/null || true
+  done
+  run_privileged umount "$MOUNT_ROOT/boot" 2>/dev/null || true
+  run_privileged umount "$MOUNT_ROOT/home" 2>/dev/null || true
+  run_privileged umount "$MOUNT_ROOT" 2>/dev/null || true
+  if run_privileged cryptsetup status "$LUKS_NAME" >/dev/null 2>&1; then
+    run_privileged cryptsetup close "$LUKS_NAME" || true
+  fi
+  printf 'error: stage3 bootstrap did not complete; temporary files, mounts, and the LUKS mapper were cleaned up.\n' >&2
+  exit "$exit_code"
+}
+
+confirm_expected_bootstrap_target_state() {
+  local entry
+  local -a unexpected=()
+
+  # disk-setup leaves only the empty @home mount and the ESP's empty EFI
+  # directory below the root mount.  A normal full rerun recreates this state.
+  while IFS= read -r entry; do
+    case ${entry##*/} in
+      home|boot) ;;
+      *) unexpected+=("$entry") ;;
+    esac
+  done < <(find "$MOUNT_ROOT" -mindepth 1 -maxdepth 1 -print)
+  while IFS= read -r entry; do unexpected+=("$entry"); done \
+    < <(find "$MOUNT_ROOT/home" -mindepth 1 -maxdepth 1 -print)
+  while IFS= read -r entry; do
+    [[ ${entry##*/} == EFI ]] || unexpected+=("$entry")
+  done < <(find "$MOUNT_ROOT/boot" -mindepth 1 -maxdepth 1 -print)
+  if [[ ! -d $MOUNT_ROOT/boot/EFI ]]; then
+    unexpected+=("missing directory: $MOUNT_ROOT/boot/EFI")
+  else
+    while IFS= read -r entry; do unexpected+=("$entry"); done \
+      < <(find "$MOUNT_ROOT/boot/EFI" -mindepth 1 -maxdepth 1 -print)
+  fi
+
+  ((${#unexpected[@]})) || return 0
+  printf '\nUnexpected stage3-bootstrap target state:\n' >&2
+  printf '  %s\n' "${unexpected[@]}" >&2
+  printf 'The normal full installer rerun recreates an empty target before this phase.\n' >&2
+  confirm_phase 'stage3 bootstrap with this unexpected target state'
+}
+
+stage3_bootstrap() {
+  local command source stage3_filename stage3_size stage3_url
+  local latest_manifest latest_verified archive sha256 sha256_verified release_keys
+  local manifest_archive manifest_size manifest_extra
+
+  if (( VERBOSE )); then
+    cat <<EOF
+Stage3 bootstrap: verified desktop-systemd base system
+======================================================
+
+The selected stage is Gentoo Release Engineering's AMD64 desktop-systemd
+archive.  The signed latest-stage manifest names the current archive; its
+example filename below is only a concrete follow-along value and will change
+as Gentoo publishes new stage3 releases.
+
+Discover, download, and verify the stage3
+-----------------------------------------
+
+The installer obtains Gentoo's release-key bundle, then accepts each signed
+manifest only when its signer is Gentoo's pinned automated-release key. Verify
+the latest-stage manifest first, then verify the detached checksum manifest
+before extracting the archive. Do not accept an archive whose signed checksum
+fails.
+
+cd /mnt/gentoo
+curl --fail --location --output gentoo-release.asc.20260125.gz https://dev.gentoo.org/~sam/dist/sec-keys/openpgp-keys-gentoo-release/gentoo-release.asc.20260125.gz
+gzip --decompress --stdout gentoo-release.asc.20260125.gz | gpg --import
+gpg --with-fingerprint --list-keys 13EBBDBEDE7A12775DFDB1BABB572E0E2D182910
+wget https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-desktop-systemd/latest-stage3-amd64-desktop-systemd.txt
+gpg --output latest-stage3-amd64-desktop-systemd.txt.verified --decrypt latest-stage3-amd64-desktop-systemd.txt
+
+wget https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-desktop-systemd/stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz
+wget https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-desktop-systemd/stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz.sha256
+gpg --output stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz.sha256.verified --decrypt stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz.sha256
+sha256sum --check stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz.sha256.verified
+
+Extract the stage and prepare the chroot
+----------------------------------------
+
+Extraction preserves extended attributes and the numeric owners assigned by
+Release Engineering.  The resolver copy and slave bind mounts make the new
+system usable for the next chroot-based configuration phase without allowing
+mount events to propagate back into the live environment.
+
+tar xpf stage3-amd64-desktop-systemd-20260913T163055Z.tar.xz --xattrs-include='*.*' --numeric-owner -C /mnt/gentoo
+cp --dereference /etc/resolv.conf /mnt/gentoo/etc/resolv.conf
+mount --types proc /proc /mnt/gentoo/proc
+mount --rbind /sys /mnt/gentoo/sys
+mount --make-rslave /mnt/gentoo/sys
+mount --rbind /dev /mnt/gentoo/dev
+mount --make-rslave /mnt/gentoo/dev
+mount --bind /run /mnt/gentoo/run
+mount --make-rslave /mnt/gentoo/run
+
+The bootstrap phase intentionally stops before entering the chroot or changing
+Portage configuration; those belong to the next semantic phase.
+EOF
+  fi
+
+  log 'Phase: stage3-bootstrap'
+
+  for command in readlink lsblk; do
+    require_command "$command"
+  done
+  [[ -n $TARGET_DISK ]] || die 'stage3-bootstrap requires --disk DEVICE to verify the prepared layout'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  [[ -b $TARGET_DISK ]] || die "target is not a block device: $TARGET_DISK"
+  [[ $MOUNT_ROOT == /* && $MOUNT_ROOT != / ]] || die "mount root must be a non-root absolute path: $MOUNT_ROOT"
+  for command in "$LUKS_NAME" "$BTRFS_LABEL" "$ROOT_SUBVOL" "$HOME_SUBVOL"; do
+    [[ $command =~ ^[A-Za-z0-9._@+-]+$ ]] || die "unsupported characters in layout name: $command"
+  done
+  [[ $ROOT_SUBVOL != "$HOME_SUBVOL" ]] || die 'root and home subvolume names must differ'
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+
+  if [[ $MODE == dry-run ]]; then
+    cat <<EOF
+
+Stage3 bootstrap plan
+  * verify the mounted disk-setup layout below $MOUNT_ROOT;
+  * validate Gentoo's signed latest-stage manifest;
+  * download the current AMD64 desktop-systemd stage3 and validate its signed
+    SHA-256 manifest;
+  * extract the archive into $MOUNT_ROOT; and
+  * prepare DNS and the chroot mounts (/proc, /sys, /dev, /run).
+
+Dry run: no network access or filesystem changes made.
+EOF
+    return 0
+  fi
+
+  for command in awk find grep tar gzip gpg sha256sum stat mount mountpoint cp mktemp; do
+    require_command "$command"
+  done
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die 'stage3 bootstrap requires curl or wget to download Gentoo release files'
+  fi
+  (( EUID == 0 )) || require_command sudo
+  for source in /etc/resolv.conf /proc /sys /dev /run; do
+    [[ -e $source ]] || die "live environment prerequisite is unavailable: $source"
+  done
+  for source in "$MOUNT_ROOT/proc" "$MOUNT_ROOT/sys" "$MOUNT_ROOT/dev" "$MOUNT_ROOT/run"; do
+    ! mountpoint -q "$source" || die "chroot mount already exists: $source"
+  done
+
+  confirm_phase 'stage3 bootstrap'
+  if (( EUID != 0 )); then
+    sudo -v || die 'sudo authorization failed; no stage3 files were downloaded'
+  fi
+  verify_disk_setup || die 'stage3-bootstrap requires a verified disk-setup layout'
+  confirm_expected_bootstrap_target_state
+
+  STAGE_WORKDIR=$(run_privileged mktemp -d "$MOUNT_ROOT/.stage3-bootstrap.XXXXXX")
+  # The downloads are public release material.  Keep the workspace traversable
+  # so the non-privileged parser can read GnuPG's verified output; the GnuPG
+  # home itself remains root-only inside this directory.
+  run_privileged chmod 755 "$STAGE_WORKDIR"
+  # EXIT covers deliberate safety stops via die(); ERR covers failed commands
+  # under errexit.  Both leave the validated disk layout itself untouched.
+  trap 'cleanup_stage3_bootstrap_failure $?' ERR EXIT
+  STAGE_GPG_HOME=$(run_privileged mktemp -d "$STAGE_WORKDIR/.gnupg.XXXXXX")
+
+  latest_manifest=$STAGE_WORKDIR/$STAGE3_LATEST_MANIFEST
+  latest_verified=$latest_manifest.verified
+  release_keys=$STAGE_WORKDIR/gentoo-release.asc.20260125.gz
+  download_file "$GENTOO_RELEASE_KEYS_URL" "$release_keys"
+  run_privileged gzip --decompress --stdout "$release_keys" \
+    | run_privileged gpg --batch --homedir "$STAGE_GPG_HOME" --import >/dev/null
+  download_file "$STAGE3_BASE_URL/$STAGE3_LATEST_MANIFEST" "$latest_manifest"
+  verify_pinned_release_signature "$latest_manifest" "$latest_verified"
+
+  # Accept exactly one release entry from the authenticated manifest.  This
+  # forbids URLs, path traversal, other architectures, and other init systems.
+  stage3_filename=
+  stage3_size=
+  # Gentoo's generated manifest may omit a trailing newline, so preserve its
+  # final record when read reports EOF after assigning that record.
+  while IFS=$' \t' read -r manifest_archive manifest_size manifest_extra || [[ -n ${manifest_archive:-} ]]; do
+    [[ -z ${manifest_extra:-} ]] || continue
+    [[ $manifest_archive =~ ^stage3-amd64-desktop-systemd-[0-9]{8}T[0-9]{6}Z\.tar\.xz$ ]] || continue
+    [[ $manifest_size =~ ^[1-9][0-9]*$ ]] || continue
+    [[ -z $stage3_filename ]] || die 'signed latest-stage manifest contains multiple matching stage3 archives'
+    stage3_filename=$manifest_archive
+    stage3_size=$manifest_size
+  done <"$latest_verified"
+  [[ -n $stage3_filename ]] || die 'signed latest-stage manifest does not name an AMD64 desktop-systemd stage3 archive'
+
+  stage3_url=$STAGE3_BASE_URL/$stage3_filename
+  archive=$STAGE_WORKDIR/$stage3_filename
+  sha256=$archive.sha256
+  sha256_verified=$sha256.verified
+  log "Downloading verified $stage3_filename"
+  download_file "$stage3_url" "$archive"
+  [[ $(stat --format=%s "$archive") == "$stage3_size" ]] \
+    || die "downloaded stage3 size does not match the signed latest-stage manifest"
+  download_file "$stage3_url.sha256" "$sha256"
+  verify_pinned_release_signature "$sha256" "$sha256_verified"
+  grep -Eq "^[[:xdigit:]]{64}[[:space:]]+\\*?$stage3_filename$" "$sha256_verified" \
+    || die 'signed SHA-256 manifest does not contain the selected stage3 archive'
+  (
+    cd "$STAGE_WORKDIR"
+    sha256sum --check --status "${sha256_verified##*/}"
+  ) || die 'stage3 SHA-256 verification failed'
+
+  log 'Extracting verified stage3 archive'
+  run_privileged tar xpf "$archive" --xattrs-include='*.*' --numeric-owner -C "$MOUNT_ROOT"
+  run_privileged cp --dereference /etc/resolv.conf "$MOUNT_ROOT/etc/resolv.conf"
+  run_privileged mount --types proc /proc "$MOUNT_ROOT/proc"
+  run_privileged mount --rbind /sys "$MOUNT_ROOT/sys"
+  run_privileged mount --make-rslave "$MOUNT_ROOT/sys"
+  run_privileged mount --rbind /dev "$MOUNT_ROOT/dev"
+  run_privileged mount --make-rslave "$MOUNT_ROOT/dev"
+  run_privileged mount --bind /run "$MOUNT_ROOT/run"
+  run_privileged mount --make-rslave "$MOUNT_ROOT/run"
+
+  [[ -x $MOUNT_ROOT/bin/bash && -r $MOUNT_ROOT/etc/resolv.conf ]] \
+    || die 'extracted stage3 is missing its shell or resolver configuration'
+  for source in "$MOUNT_ROOT/proc" "$MOUNT_ROOT/sys" "$MOUNT_ROOT/dev" "$MOUNT_ROOT/run"; do
+    mountpoint -q "$source" || die "required chroot mount is missing: $source"
+  done
+  run_privileged rm -rf -- "$STAGE_WORKDIR"
+  unset STAGE_WORKDIR STAGE_GPG_HOME
+  trap - ERR EXIT
+
+  log 'Stage3 bootstrap complete'
+  cat <<EOF
+
+The verified AMD64 desktop-systemd stage3 is installed at $MOUNT_ROOT.
+DNS and /proc, /sys, /dev, and /run are mounted there for the next phase.
+EOF
+}
+
 main() {
   parse_args "$@"
   if is_selected disk-setup; then
     disk_setup
+  fi
+  if is_selected stage3-bootstrap; then
+    stage3_bootstrap
   fi
 }
 
