@@ -1106,7 +1106,7 @@ deferred to the system-update phase.
 EOF
 }
 
-portage_foundation() {
+install_portage_foundation() {
   local command source config_git_dir config_revision signature_status
 
   if (( VERBOSE )); then
@@ -1282,7 +1282,7 @@ main() {
     stage3_bootstrap
   fi
   if is_selected portage-foundation; then
-    portage_foundation
+    install_portage_foundation
   fi
 }
 
