@@ -1476,12 +1476,28 @@ EOF
   local -a update_options=()
   (( ASSUME_YES == 0 )) || update_options+=(--yes)
   run_privileged install -m 700 "$0" "$MOUNT_ROOT$internal_script"
-  run_privileged chroot "$MOUNT_ROOT" /usr/bin/env -i \
-    HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    TERM="${TERM:-dumb}" /bin/bash "$internal_script" \
+  # Keep cleanup in the same root process: sudo credentials may expire during
+  # the build. Cleanup warnings must not replace the update's exit status.
+  run_privileged /bin/bash -c '
+    target_root=$1
+    helper=$2
+    shift 2
+    cleanup_update_helper() {
+      local update_status=$?
+      trap - EXIT
+      if ! rm -f -- "$target_root$helper"; then
+        printf "Warning: could not remove temporary update helper: %s\n" \
+          "$target_root$helper" >&2
+      fi
+      exit "$update_status"
+    }
+    trap cleanup_update_helper EXIT
+    chroot "$target_root" /usr/bin/env -i \
+      HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      TERM="${TERM:-dumb}" /bin/bash "$helper" "$@"
+  ' "$PROGRAM-update" "$MOUNT_ROOT" "$internal_script" \
     --internal-update-chroot --target-host "$TARGET_HOST" \
     --cpu-flags "$TARGET_CPU_FLAGS" "${update_options[@]}" || status=$?
-  run_privileged rm -f -- "$MOUNT_ROOT$internal_script"
   (( status == 0 )) || die 'system-update did not complete; target remains mounted for review and retry'
   log 'System update complete: ready for kernel installation'
 }
