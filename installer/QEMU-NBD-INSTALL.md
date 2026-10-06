@@ -11,7 +11,7 @@ running these instructions is the production path.
 ## Host tools
 
 ```bash
-sudo pacman -S --needed qemu-base btrfs-progs cryptsetup curl dosfstools git gnupg
+sudo pacman -S --needed qemu-base virt-firmware psmisc btrfs-progs cryptsetup curl dosfstools git gnupg
 ```
 
 ## Set up this install shell
@@ -97,10 +97,10 @@ attach_target
 cd /home/graham/Projects/gentoo-notes
 ./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
   --config-source "$CONFIG_SOURCE" --config-branch "$CONFIG_BRANCH" \
-  --target-host qemu --dry-run --verbose
+  --target-host qemu --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --dry-run --verbose
 ./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
   --config-source "$CONFIG_SOURCE" --config-branch "$CONFIG_BRANCH" \
-  --target-host qemu --verbose
+  --target-host qemu --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --verbose
 
 sudo findmnt -R /mnt/gentoo
 sudo bash -c '[[ -r /mnt/gentoo/etc/gentoo-release ]]'
@@ -125,6 +125,32 @@ sudo chroot /mnt/gentoo gentoo-config diff
 sudo chroot /mnt/gentoo cat /etc/portage/package.use/00cpu-flags
 ```
 
+## Prepare the distribution kernel
+
+The default installer also runs `kernel-foundation`. To resume only that phase
+on the existing mounted target:
+
+```bash
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --phase kernel-foundation \
+  --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --dry-run --verbose
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --phase kernel-foundation \
+  --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --verbose
+sudo chroot /mnt/gentoo cat /etc/kernel/gentoo-dist.cmdline
+sudo ls -lh /mnt/gentoo/boot/EFI/Gentoo/
+virt-fw-vars --input "$INSTALL_DIR/OVMF_VARS.4m.fd" --print
+```
+
+Use the installer's `--verbose` output for phase details. Save the printed kernel
+version and command line for the later VM boot test.
+
+Stop the VM before running this phase. It creates or updates the specified
+OVMF store offline; use that same file in the QEMU command below. The default
+template matches the CODE file shown below; for another OVMF build, supply
+`--qemu-vars-template` with its matching VARS template. Detach NBD before
+starting QEMU. First-boot configuration and boot testing remain a later step.
+
 ## Detach and preserve the target for later work
 
 ```bash
@@ -135,22 +161,30 @@ detach_target
 
 ```bash
 detach_target
+# A fresh disk gets a new ESP GUID. Archive its old firmware store as well.
+if [[ -e "$INSTALL_DIR/OVMF_VARS.4m.fd" ]]; then
+  mv "$INSTALL_DIR/OVMF_VARS.4m.fd" "$INSTALL_DIR/OVMF_VARS.4m.fd.previous-$(date +%Y%m%d-%H%M%S)"
+fi
 rm -f "$IMAGE"
 qemu-img create -f qcow2 "$IMAGE" 32G
 attach_target
 ```
 
-## Boot after the UKI phase exists
+## Boot after first-boot configuration
 
 ```bash
-cp /usr/share/edk2/x64/OVMF_VARS.4m.fd "$INSTALL_DIR/OVMF_VARS.4m.fd"
-qemu-system-x86_64 \
-  -enable-kvm \
-  -machine q35 \
-  -cpu host \
-  -m 4096 \
-  -smp 4 \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
-  -drive if=pflash,format=raw,file="$INSTALL_DIR/OVMF_VARS.4m.fd" \
-  -drive if=virtio,format=qcow2,file="$IMAGE"
+# Use the persistent store prepared by kernel-foundation; do not reinitialize it.
+if [[ -f "$INSTALL_DIR/OVMF_VARS.4m.fd" ]]; then
+  qemu-system-x86_64 \
+    -enable-kvm \
+    -machine q35 \
+    -cpu host \
+    -m 4096 \
+    -smp 4 \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+    -drive if=pflash,format=raw,file="$INSTALL_DIR/OVMF_VARS.4m.fd" \
+    -drive if=virtio,format=qcow2,file="$IMAGE"
+else
+  printf 'Run kernel-foundation to prepare the VM firmware store first.\n'
+fi
 ```

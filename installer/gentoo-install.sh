@@ -7,7 +7,7 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns four phases:
+# This installer currently owns five phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
 #   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
@@ -15,10 +15,14 @@
 #   portage-foundation: install the live configuration work tree, configure
 #   Portage for Git synchronization, and establish locale and timezone.
 #   system-update: establish CPU policy, update @world, and review configuration.
+#   kernel-foundation: install the binary distribution kernel, firmware, and
+#   broad initramfs, then validate EFI files and register QEMU firmware offline.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
-# Later phases will build the kernel and install the UKI.
+# kernel-foundation prepares the distribution fallback and QEMU EFI entry.
+# Physical EFI registration and first boot remain later work; custom kernels
+# are built after installation.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
   printf 'error: this installer requires Bash.\n' >&2
@@ -56,10 +60,15 @@ TARGET_TIMEZONE=${TARGET_TIMEZONE:-$DEFAULT_TIMEZONE}
 TARGET_LOCALE=${TARGET_LOCALE:-$DEFAULT_LOCALE}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update)
+SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation)
 VERBOSE=0
 INTERNAL_PORTAGE_CHROOT=0
 INTERNAL_UPDATE_CHROOT=0
+INTERNAL_KERNEL_CHROOT=0
+TARGET_MICROCODE=${TARGET_MICROCODE:-auto}
+TARGET_SOF_FIRMWARE=
+QEMU_VARS=${QEMU_VARS:-}
+QEMU_VARS_TEMPLATE=${QEMU_VARS_TEMPLATE:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}
 TARGET_CPU_FLAGS=${TARGET_CPU_FLAGS:-}
 
 EFI_PARTITION=
@@ -69,7 +78,7 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update)
+PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation)
 
 usage() {
   cat <<EOF
@@ -77,7 +86,8 @@ Usage: $PROGRAM --disk DEVICE [options]
 
 Install the selected Gentoo phases.  The current milestone prepares an
 encrypted Btrfs disk, bootstraps the verified stage3, and establishes the
-target's Portage configuration, then updates the base system.
+target's Portage configuration, then updates the base system and prepares
+the distribution kernel for direct EFI boot.
 
 Required:
   --disk DEVICE              Whole block device to erase, for example /dev/nvme0n1
@@ -90,7 +100,8 @@ Options:
   --verbose                  Print technical notes and detailed phase output.
                               It does not affect execution or confirmations.
   --phase NAME               Run a named phase (currently: disk-setup,
-                              stage3-bootstrap, portage-foundation, system-update). May be
+                              stage3-bootstrap, portage-foundation, system-update,
+                              kernel-foundation). May be
                               repeated; phases run in installer order.
   --config-source SOURCE     Public Git URL or local repository path
                               (default: $CONFIG_SOURCE).
@@ -100,6 +111,12 @@ Options:
                               (default: $TARGET_HOST).
   --cpu-flags FLAGS          Explicit CPU_FLAGS_X86 flags for another target;
                               otherwise detect the running CPU.
+  --microcode KIND           auto, intel, amd, or none (default: $TARGET_MICROCODE).
+                              auto detects the installation host CPU vendor.
+  --qemu-vars FILE           Persistent raw OVMF variable store for target qemu;
+                              required for its kernel-foundation phase.
+  --qemu-vars-template FILE  Matching OVMF template used only for a new store
+                              (default: $QEMU_VARS_TEMPLATE).
   --timezone ZONE            Target timezone (default: $TARGET_TIMEZONE).
   --locale LOCALE            Target UTF-8 locale (default: $TARGET_LOCALE).
   --luks-name NAME           Mapper name after opening LUKS (default: $LUKS_NAME).
@@ -113,7 +130,9 @@ Options:
 
 Environment overrides mirror these options: TARGET_DISK, LUKS_NAME,
 BTRFS_LABEL, ROOT_SUBVOL, HOME_SUBVOL, EFI_SIZE, MOUNT_ROOT, CONFIG_SOURCE,
-CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, TARGET_LOCALE, and TARGET_CPU_FLAGS.
+CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, TARGET_LOCALE, TARGET_CPU_FLAGS,
+TARGET_MICROCODE, QEMU_VARS, and QEMU_VARS_TEMPLATE.
+SOF audio firmware is selected by the target's gentoo-config fragments.
 
 Safety model:
   * Selected phases run by default; --dry-run is the non-destructive mode.
@@ -265,6 +284,25 @@ parse_args() {
         shift
         ;;
       --cpu-flags=*) TARGET_CPU_FLAGS=${1#*=} ;;
+      --microcode)
+        (($# >= 2)) || die '--microcode requires auto, intel, amd, or none'
+        TARGET_MICROCODE=$2
+        shift
+        ;;
+      --microcode=*) TARGET_MICROCODE=${1#*=} ;;
+      --qemu-vars)
+        (($# >= 2)) || die '--qemu-vars requires a file path'
+        QEMU_VARS=$2
+        shift
+        ;;
+      --qemu-vars=*) QEMU_VARS=${1#*=} ;;
+      --qemu-vars-template)
+        (($# >= 2)) || die '--qemu-vars-template requires a file path'
+        QEMU_VARS_TEMPLATE=$2
+        shift
+        ;;
+      --qemu-vars-template=*) QEMU_VARS_TEMPLATE=${1#*=} ;;
+      --internal-kernel-chroot) INTERNAL_KERNEL_CHROOT=1 ;;
       --internal-update-chroot) INTERNAL_UPDATE_CHROOT=1 ;;
       --internal-portage-chroot) INTERNAL_PORTAGE_CHROOT=1 ;;
       -h|--help)
@@ -1502,8 +1540,696 @@ EOF
   log 'System update complete: ready for kernel installation'
 }
 
+# Distribution kernel foundation: independent from the later custom EFI image.
+# Upstream references:
+# https://wiki.gentoo.org/wiki/Distribution_Kernel
+# https://wiki.gentoo.org/wiki/Installkernel
+# https://wiki.gentoo.org/wiki/Dracut
+# https://wiki.gentoo.org/wiki/Handbook:AMD64/Installation/Kernel
+
+# Resolve the vendor-level microcode choice without pruning firmware files.
+# Auto microcode reads the running installation host, not the destination CPU;
+# cross-vendor installations must provide an explicit --microcode selection.
+resolve_kernel_firmware_policy() {
+  case $TARGET_MICROCODE in
+    auto)
+      local vendor
+      vendor=$(awk -F: '/vendor_id/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' /proc/cpuinfo)
+      case $vendor in
+        GenuineIntel) TARGET_MICROCODE=intel ;;
+        AuthenticAMD) TARGET_MICROCODE=amd ;;
+        *) die 'CPU vendor is unknown; specify --microcode intel, amd, or none' ;;
+      esac
+      ;;
+    intel|amd|none) ;;
+    *) die 'microcode must be auto, intel, amd, or none' ;;
+  esac
+}
+
+# Read firmware requirements from the installed configuration's common and host
+# shell fragments. Validate the resolved SOF value rather than duplicating target
+# hardware choices in command-line switches or installer defaults.
+read_kernel_firmware_policy() {
+  local root=$1 directory SOF_FIRMWARE=
+  directory=${root%/}/etc/gentoo-config/kernel-firmware.d
+  valid_target_host "$TARGET_HOST" || die "unsupported kernel target: $TARGET_HOST"
+  [[ -f $directory/00-common && ! -L $directory/00-common ]] \
+    || die "missing firmware policy: $directory/00-common; update the target gentoo-config checkout"
+  source "$directory/00-common"
+  if [[ -e $directory/90-$TARGET_HOST || -L $directory/90-$TARGET_HOST ]]; then
+    [[ -f $directory/90-$TARGET_HOST && ! -L $directory/90-$TARGET_HOST ]] \
+      || die "firmware policy is not a regular file: $directory/90-$TARGET_HOST"
+    source "$directory/90-$TARGET_HOST"
+  fi
+  case $SOF_FIRMWARE in
+    yes|no) TARGET_SOF_FIRMWARE=$SOF_FIRMWARE ;;
+    *) die "SOF_FIRMWARE must be yes or no in $directory" ;;
+  esac
+}
+
+# Write policy supplied on stdin, replacing only regular installer-marked files.
+# Unmarked files and symlinks stop the phase for the user to inspect and reconcile;
+# the marker permits full replacement, including any edits that retained it.
+kernel_policy_file() {
+  local path=$1 content
+  content=$(cat)
+  if [[ -e $path || -L $path ]]; then
+    [[ -f $path && ! -L $path ]] || die "kernel policy is not a regular file: $path"
+    grep -Fxq '# Managed by gentoo-install kernel-foundation.' "$path" \
+      || die "existing kernel policy requires manual review: $path"
+  fi
+  printf '%s\n' "$content" >"$path"
+}
+
+# Record target boot parameters or ESP identity, allowing retries with the same value.
+# An existing file must be regular, not a symlink, and contain matching text;
+# a conflict stops the phase rather than silently changing the boot target.
+kernel_target_data() {
+  local path=$1 value=$2
+  if [[ -e $path || -L $path ]]; then
+    [[ -f $path && ! -L $path && $(cat "$path") == "$value" ]] \
+      || die "existing target boot data requires manual review: $path"
+  fi
+  printf '%s\n' "$value" >"$path"
+}
+
+# Check host-side offline firmware prerequisites before installing packages.
+# Require an explicit VM store and a stopped VM; a new store needs a matching
+# raw OVMF template, while existing stores retain their firmware state.
+check_qemu_firmware() {
+  [[ $TARGET_HOST == qemu ]] || {
+    [[ -z $QEMU_VARS ]] || die '--qemu-vars is only valid for target qemu'
+    return
+  }
+  [[ -n $QEMU_VARS ]] || die 'target qemu requires --qemu-vars FILE for offline EFI registration'
+  [[ $QEMU_VARS != *$'\n'* ]] || die 'QEMU variable-store path must be a single line'
+  [[ ! -L $QEMU_VARS ]] || die 'QEMU variable store must not be a symlink'
+  QEMU_VARS=$(readlink -m -- "$QEMU_VARS")
+  [[ -d ${QEMU_VARS%/*} ]] || die 'create the QEMU variable-store parent directory first'
+  require_command python3
+  require_command fuser
+  require_command sfdisk
+  python3 -c 'from virt.firmware.varstore.edk2 import Edk2VarStore; from virt.firmware.efi import bootentry, devpath, ucs16' \
+    || die 'offline QEMU registration requires host Python virt-firmware (Arch: pacman -S virt-firmware)'
+  if [[ -e $QEMU_VARS ]]; then
+    [[ -f $QEMU_VARS ]] || die 'QEMU variable store must be a regular raw OVMF file'
+    if run_privileged fuser -s "$QEMU_VARS"; then
+      die 'QEMU variable store is in use; stop the VM before offline registration'
+    fi
+  else
+    [[ -f $QEMU_VARS_TEMPLATE && -r $QEMU_VARS_TEMPLATE ]] \
+      || die "matching OVMF template is unavailable: $QEMU_VARS_TEMPLATE"
+  fi
+  python3 - "$QEMU_VARS" "$QEMU_VARS_TEMPLATE" <<'PY'
+import os
+import sys
+import fcntl
+from virt.firmware.varstore.edk2 import Edk2VarStore
+
+if os.path.exists(sys.argv[1]):
+    with open(sys.argv[1], 'r+b') as stream:
+        try:
+            fcntl.lockf(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit('error: QEMU variable store is locked; stop the VM before offline registration')
+Edk2VarStore(sys.argv[1] if os.path.exists(sys.argv[1]) else sys.argv[2])
+PY
+}
+
+# Register the validated kernel in this VM's raw OVMF store, outside the chroot.
+# Bind the EFI path to the target GPT partition, preserve other variables and
+# entries, and verify a temporary output before atomically replacing the store.
+register_qemu_distribution_kernel() {
+  [[ $TARGET_HOST == qemu ]] || return 0
+  check_qemu_firmware
+  log 'Registering the distribution kernel in QEMU firmware offline'
+  run_privileged python3 - "$QEMU_VARS" "$QEMU_VARS_TEMPLATE" \
+    "$TARGET_DISK" "$EFI_PARTITION" "$MOUNT_ROOT" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+from virt.firmware.efi import bootentry, devpath, ucs16
+from virt.firmware.varstore.edk2 import Edk2VarStore
+
+# Compare every live variable, including authenticated-variable timestamps.
+# This verifies preservation as well as the newly generated boot entry.
+def firmware_state(variables):
+    return {name: (v.guid, v.attr, v.data, v.bytes_time() if v.time else None)
+            for name, v in variables.items()}
+
+destination, template, disk, esp, root = map(Path, sys.argv[1:])
+locks = []
+temporary = None
+backup = None
+try:
+    # Lock existing and replacement inodes against QEMU's POSIX file locking.
+    exists = destination.exists()
+    if destination.is_symlink():
+        raise ValueError('variable store must not be a symlink')
+    if exists:
+        descriptor = os.open(destination, os.O_RDWR | os.O_NOFOLLOW)
+        locks.append(descriptor)
+        fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ownership = os.fstat(descriptor)
+        if not stat.S_ISREG(ownership.st_mode):
+            raise ValueError('variable store must be a regular file')
+    else:
+        ownership = destination.parent.stat()
+    store = Edk2VarStore(str(destination if exists else template))
+    if exists:
+        fcntl.lockf(locks[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    variables = store.get_varlist()
+    table = json.loads(subprocess.check_output(
+        ['sfdisk', '--json', str(disk)], text=True))['partitiontable']
+    if table['label'] != 'gpt' or table.get('unit') != 'sectors':
+        raise ValueError('offline EFI registration requires GPT')
+    partitions = [p for p in table['partitions'] if Path(p['node']).resolve() == esp.resolve()]
+    if len(partitions) != 1:
+        raise ValueError('could not identify the target ESP in GPT')
+    partition = partitions[0]
+    if partition['type'].lower() != 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b':
+        raise ValueError('target partition is not an ESP')
+    # sfdisk reports start/size in this disk's logical sectors, as UEFI requires.
+    version_lines = (root / 'etc/kernel/gentoo-dist.version').read_text().splitlines()
+    if len(version_lines) != 2 or version_lines[0] != '# Managed by gentoo-install kernel-foundation.':
+        raise ValueError('missing installer-validated distribution kernel version')
+    version = version_lines[1]
+    if not re.fullmatch(r'[A-Za-z0-9._+-]+-gentoo-dist(?:-bin)?', version):
+        raise ValueError('unexpected distribution kernel release')
+    kernel = rf'\EFI\Gentoo\kernel-{version}.efi'
+    initrd = rf'\EFI\Gentoo\initramfs-{version}.img'
+    for filename in (f'kernel-{version}.efi', f'initramfs-{version}.img'):
+        if (root / 'boot/EFI/Gentoo' / filename).stat().st_size == 0:
+            raise ValueError(f'empty boot artifact: {filename}')
+    cmdline = (root / 'etc/kernel/gentoo-dist.cmdline').read_text().rstrip('\n')
+    if not cmdline or any(c in cmdline for c in '\r\n\0'):
+        raise ValueError('kernel command line must be a single nonempty line')
+    options = bytes(ucs16.from_string(f'{cmdline} initrd={initrd}'))
+    path = devpath.DevicePath()
+    node = devpath.DevicePathElem()
+    node.set_gpt(1, partition['start'], partition['size'], partition['uuid'])
+    path.append(node)
+    path.extend(devpath.DevicePath.filepath(kernel))
+    title = f'Gentoo distribution {version}'
+    matching = []
+    for name, variable in variables.items():
+        if not re.fullmatch(r'Boot[0-9A-Fa-f]{4}', name):
+            continue
+        entry = bootentry.BootEntry(variable.data)
+        if str(entry.title).startswith('Gentoo distribution '):
+            guids = [str(n.get_partuuid()).lower() for n in entry.devicepath if n.get_partuuid()]
+            if guids != [partition['uuid'].lower()]:
+                raise ValueError('existing Gentoo entry belongs to another ESP; review the VM store')
+        if entry.devicepath == path:
+            matching.append(int(name[4:], 16))
+    if len(matching) > 1:
+        raise ValueError('multiple entries already match this kernel; review the VM store')
+    before = firmware_state(variables)
+    if matching:
+        index = matching[0]
+        variables.set_boot_entry(index, title, path, options)
+    else:
+        index = variables.add_boot_entry(title, path, options)
+        if index is None:
+            raise ValueError('no free EFI boot entry number')
+    order_variable = variables.get('BootOrder')
+    order_data = order_variable.data if order_variable else b''
+    if len(order_data) % 2:
+        raise ValueError('malformed BootOrder')
+    order = list(struct.unpack(f'<{len(order_data) // 2}H', order_data))
+    if order_variable is None:
+        order_variable = variables.create('BootOrder')
+    order_variable.set_boot_order([index] + [n for n in order if n != index])
+    expected = firmware_state(variables)
+    if exists and before == expected:
+        print(f'QEMU firmware already contains Boot{index:04X}: {title}')
+        sys.exit(0)
+    descriptor, temporary = tempfile.mkstemp(prefix=f'.{destination.name}.', dir=destination.parent)
+    locks.append(descriptor)
+    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    store.write_varstore(temporary, variables)
+    with open(temporary, 'rb') as stream:
+        os.fsync(stream.fileno())
+    reopened = Edk2VarStore(temporary)
+    actual = firmware_state(reopened.get_varlist())
+    if actual != expected or len(reopened.filedata) != len(store.filedata):
+        raise ValueError('offline firmware output failed round-trip validation')
+    # Library reads/writes close descriptors, releasing process-scoped POSIX
+    # locks. Reacquire after the final read before publishing the new inode.
+    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.fchown(descriptor, ownership.st_uid, ownership.st_gid)
+    os.fchmod(descriptor, stat.S_IMODE(ownership.st_mode) if exists else 0o600)
+    if exists:
+        backup_fd, backup = tempfile.mkstemp(prefix=f'{destination.name}.backup-', dir=destination.parent)
+        os.close(backup_fd)
+        shutil.copy2(destination, backup)
+        os.chown(backup, ownership.st_uid, ownership.st_gid)
+        fcntl.lockf(locks[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.replace(temporary, destination)
+    temporary = None
+    print(f'Registered Boot{index:04X}: {title}')
+    print(f'ESP partition GUID: {partition["uuid"]}')
+    print(f'EFI path: {kernel}\nLoad options: {options.decode("utf-16-le").rstrip(chr(0))}')
+    print(f'VM firmware store: {destination}')
+    if backup:
+        print(f'Previous firmware store: {backup}')
+except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    print(f'error: offline QEMU EFI registration failed: {error}', file=sys.stderr)
+    sys.exit(1)
+finally:
+    if temporary:
+        os.unlink(temporary)
+    for descriptor in locks:
+        os.close(descriptor)
+PY
+}
+
+# Inspect the installed release and initramfs for matching EFI/kernel artifacts,
+# encrypted-root tools, boot drivers, microcode, and any installed NVIDIA modules.
+# These checks validate boot ingredients; successful boot still needs a VM or hardware.
+verify_distribution_kernel() {
+  local version=$1 image=/boot/EFI/Gentoo/kernel-$1.efi
+  local initrd=/boot/EFI/Gentoo/initramfs-$1.img listing modules driver filename
+  [[ -s $image && -s $initrd && -s /lib/modules/$version/modules.dep ]] \
+    || die "kernel, initramfs, or module dependency index is missing for $version"
+  [[ $(head -c 2 "$image") == MZ ]] || die 'distribution kernel is not an EFI executable'
+  grep -Fxq 'CONFIG_EFI_STUB=y' "/lib/modules/$version/build/.config" \
+    || die 'distribution kernel does not provide EFI stub support'
+  cmp -s "$image" "/lib/modules/$version/vmlinuz" \
+    || die 'EFI image differs from the installed distribution kernel'
+  modules=$(lsinitrd -m "$initrd")
+  for driver in crypt btrfs; do
+    grep -Eq "^[[:space:]]*$driver[[:space:]]*$" <<<"$modules" \
+      || die "initramfs lacks the Dracut $driver module"
+  done
+  listing=$(lsinitrd "$initrd")
+  grep -Eq '[ /](systemd-)?cryptsetup([[:space:]]|$)' <<<"$listing" \
+    || die 'initramfs lacks a LUKS unlock executable'
+  # Check the installed kernel's drivers, never the currently running host's.
+  for driver in btrfs dm_crypt nvme ahci virtio_pci virtio_blk usbhid hid_generic xhci_pci atkbd; do
+    filename=$(modinfo -k "$version" -F filename "$driver")
+    if [[ $filename != '(builtin)' ]]; then
+      filename=${filename##*/}
+      grep -Fq "$filename" <<<"$listing" || die "initramfs lacks $driver ($filename)"
+    fi
+  done
+  if [[ $TARGET_MICROCODE != none ]]; then
+    local microcode_blob=AuthenticAMD.bin
+    [[ $TARGET_MICROCODE != intel ]] || microcode_blob=GenuineIntel.bin
+    grep -Fq "$microcode_blob" <<<"$listing" \
+      || die 'initramfs lacks early CPU microcode'
+  fi
+  if portageq has_version / x11-drivers/nvidia-drivers; then
+    for driver in nvidia nvidia_modeset nvidia_drm nvidia_uvm; do
+      [[ $(modinfo -k "$version" -F vermagic "$driver") == "$version "* ]] \
+        || die "NVIDIA module does not match $version: $driver"
+    done
+  fi
+  printf '\nValidated distribution kernel: %s\nEFI kernel: %s\nInitramfs: %s\n' "$version" "$image" "$initrd"
+}
+
+# Configure and install the binary fallback kernel inside the mounted Gentoo target.
+# Establish update policy, install tools/firmware, rebuild modules and initramfs,
+# then validate the selected release without writing firmware boot entries.
+kernel_foundation_chroot() {
+  local root_uuid luks_uuid efi_uuid cmdline atom version pending
+  require_command emerge
+  require_command portageq
+  local -a tools=(sys-kernel/installkernel sys-kernel/dracut sys-fs/btrfs-progs sys-fs/cryptsetup sys-boot/efibootmgr)
+  local -a packages=(sys-kernel/linux-firmware)
+  (( EUID == 0 )) || die 'the internal kernel phase must run as root'
+  [[ -r /etc/gentoo-release && -d /var/lib/gentoo-config/repository.git ]] \
+    || die 'kernel-foundation requires the Gentoo target and configuration repository'
+  valid_target_host "$TARGET_HOST" || die 'unsupported kernel target'
+  grep -Fxq "GENTOO_TARGET_HOST=\"$TARGET_HOST\"" /etc/gentoo-config/target-host \
+    || die 'kernel target differs from the installed Portage foundation'
+  read_kernel_firmware_policy /
+  [[ -s /etc/portage/package.use/00cpu-flags ]] || die 'run system-update before kernel-foundation'
+  pending=$(pending_config_updates)
+  [[ -z $pending ]] || die "resolve protected configuration updates first: $pending"
+  mountpoint -q /boot && [[ $(findmnt -n -o FSTYPE --target /boot) == vfat ]] \
+    || die 'the target EFI partition must be mounted at /boot'
+  case ${TARGET_DISK##*/} in
+    *[0-9]) CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+  root_uuid=$(blkid -s UUID -o value "/dev/mapper/$LUKS_NAME")
+  luks_uuid=$(cryptsetup luksUUID "$CRYPT_PARTITION")
+  [[ $root_uuid =~ ^[[:xdigit:]-]+$ && $luks_uuid =~ ^[[:xdigit:]-]+$ ]] || die 'invalid target UUIDs'
+  [[ $ROOT_SUBVOL =~ ^[A-Za-z0-9_@.-]+$ && $LUKS_NAME =~ ^[A-Za-z0-9_-]+$ ]] \
+    || die 'kernel root subvolume or mapper name contains unsupported characters'
+  efi_uuid=$(findmnt -n -o UUID --target /boot)
+  [[ $efi_uuid =~ ^[[:xdigit:]-]+$ ]] || die 'could not identify the mounted ESP UUID'
+  cmdline="root=UUID=$root_uuid rootfstype=btrfs rootflags=subvol=$ROOT_SUBVOL rd.luks.uuid=luks-$luks_uuid rd.luks.name=$luks_uuid=$LUKS_NAME ro"
+
+  install -d /etc/portage/package.use /etc/portage/package.accept_keywords /etc/kernel/install.d /etc/dracut.conf.d
+  # Retire only earlier installer-owned policy names; never delete user files.
+  local old_policy
+  for old_policy in /etc/portage/package.use/99-kernel-foundation /etc/portage/package.accept_keywords/99-kernel-foundation; do
+    if [[ -f $old_policy && ! -L $old_policy ]] &&
+      grep -Fxq '# Managed by gentoo-install kernel-foundation.' "$old_policy"; then
+      rm -- "$old_policy"
+    fi
+  done
+  kernel_policy_file /etc/portage/package.use/zz-kernel-foundation <<'POLICY'
+# Managed by gentoo-install kernel-foundation.
+*/* dist-kernel
+sys-apps/systemd kernel-install
+sys-kernel/installkernel systemd dracut -efistub -grub -systemd-boot -refind -uki -ukify -ugrd
+sys-kernel/dracut systemd
+sys-kernel/gentoo-kernel-bin initramfs -generic-uki
+# Broad fallback firmware; target-specific pruning belongs to the custom path.
+sys-kernel/linux-firmware -savedconfig
+sys-firmware/intel-microcode -hostonly
+POLICY
+  # The inherited configuration keywords virtual/dist-kernel for testing.
+  # Keep its provider aligned with the stable binary fallback, so future world
+  # updates cannot satisfy a newer testing virtual by compiling gentoo-kernel.
+  kernel_policy_file /etc/portage/package.accept_keywords/zz-kernel-foundation <<'POLICY'
+# Managed by gentoo-install kernel-foundation.
+sys-kernel/gentoo-kernel-bin -~amd64
+virtual/dist-kernel -~amd64
+POLICY
+  kernel_policy_file /etc/kernel/install.conf <<'POLICY'
+# Managed by gentoo-install kernel-foundation.
+# efistub layout copies files; USE=-efistub disables EFI registration plugins.
+layout=efistub
+initrd_generator=dracut
+uki_generator=none
+BOOT_ROOT=/boot
+POLICY
+  kernel_policy_file /etc/dracut.conf.d/99-gentoo-dist.conf <<'POLICY'
+# Managed by gentoo-install kernel-foundation.
+# The chroot sees the installation host, not the destination machine.
+hostonly="no"
+hostonly_cmdline="no"
+uefi="no"
+early_microcode="yes"
+add_dracutmodules+=" crypt btrfs "
+add_drivers+=" nvme ahci virtio_pci virtio_blk virtio_scsi usbhid hid_generic xhci_pci atkbd i8042 "
+POLICY
+  kernel_target_data /etc/kernel/gentoo-dist.cmdline "$cmdline"
+  kernel_target_data /etc/kernel/gentoo-dist-esp.uuid "$efi_uuid"
+  kernel_policy_file /etc/kernel/install.d/04-gentoo-dist-esp.install <<'POLICY'
+#!/usr/bin/env bash
+# Managed by gentoo-install kernel-foundation.
+set -euo pipefail
+[[ ${1:-} == add ]] || exit 0
+case ${2:-} in *-gentoo-dist|*-gentoo-dist-bin) ;; *) exit 0 ;; esac
+# Fail before generation/copy if the ESP is missing during a later update.
+expected=$(cat /etc/kernel/gentoo-dist-esp.uuid)
+mountpoint -q /boot && [[ $(findmnt -n -o FSTYPE --target /boot) == vfat ]] &&
+  [[ $(findmnt -n -o UUID --target /boot) == "$expected" ]] || {
+  printf 'Distribution kernel update requires the target ESP mounted at /boot.\n' >&2
+  exit 1
+}
+POLICY
+  chmod 755 /etc/kernel/install.d/04-gentoo-dist-esp.install
+  [[ $TARGET_MICROCODE != intel ]] || packages+=(sys-firmware/intel-microcode)
+  [[ $TARGET_SOF_FIRMWARE != yes ]] || packages+=(sys-firmware/sof-firmware)
+  # Use a filename after common in lexical order: 99-* sorts before common.
+  # Keep the binary provider in every transaction to prevent an OR dependency
+  # (firmware -> virtual/dist-kernel) from selecting the source provider.
+  # Explicit packages, rather than @early_install (which also contains sources
+  # and Genkernel). kernel-bin is an ebuild containing a prebuilt kernel; this
+  # works even with the installer's policy of disabling Portage binpkg use.
+  emerge --pretend --verbose --update --newuse --usepkg=n --getbinpkg=n "${tools[@]}" "${packages[@]}" sys-kernel/gentoo-kernel-bin
+  confirm_phase 'distribution kernel packages (review the plan above)'
+  # Dracut modules require target-side tools before the kernel postinst runs.
+  # This transaction has no firmware -> virtual/dist-kernel dependency.
+  emerge --verbose --update --newuse --usepkg=n --getbinpkg=n "${tools[@]}"
+  # Fail closed if local overrides re-enable firmware-writing plugins.
+  local hook
+  for hook in /usr/lib/kernel/install.d/*efistub* /etc/kernel/install.d/*efistub*; do
+    [[ ! -e $hook ]] || die "unexpected firmware registration hook: $hook"
+  done
+  emerge --verbose --update --newuse --usepkg=n --getbinpkg=n "${packages[@]}" sys-kernel/gentoo-kernel-bin
+  emerge --oneshot --verbose --usepkg=n --getbinpkg=n @module-rebuild
+  atom=$(portageq best_version / sys-kernel/gentoo-kernel-bin)
+  [[ -n $atom ]] || die 'binary distribution kernel was not installed'
+  # pkg_config regenerates the initramfs after external modules are ready,
+  # using the installed package's release rather than uname -r.
+  emerge --config "=$atom"
+  # Resolve the version from this package's recorded installed kernel tree.
+  local -a release_files=()
+  local contents_path
+  while IFS= read -r contents_path; do
+    [[ -r $contents_path ]] && release_files+=("$contents_path")
+  done < <(awk '$1 == "obj" && $2 ~ /\/include\/config\/kernel.release$/ { print $2 }' "/var/db/pkg/$atom/CONTENTS")
+  ((${#release_files[@]} == 1)) || die "could not identify the installed kernel release for $atom"
+  version=$(<"${release_files[0]}")
+  [[ $version =~ ^[A-Za-z0-9._+-]+-gentoo-dist(-bin)?$ ]] || die "unexpected distribution kernel release: $version"
+  verify_distribution_kernel "$version"
+  kernel_policy_file /etc/kernel/gentoo-dist.version <<VERSION
+# Managed by gentoo-install kernel-foundation.
+$version
+VERSION
+  pending=$(pending_config_updates)
+  [[ -z $pending ]] || die "kernel packages left protected configuration updates: $pending"
+  printf '\nKernel command line:\n%s\n' "$cmdline"
+  printf 'EFI initrd argument: initrd=\\EFI\\Gentoo\\initramfs-%s.img\n' "$version"
+  if [[ $TARGET_HOST == qemu ]]; then
+    printf 'The host-side phase will now register this kernel in the offline VM firmware store.\n'
+  else
+    printf 'No firmware entry was registered. Register on the destination motherboard.\n'
+  fi
+  printf 'After kernel updates, register the new version; retain a tested previous entry.\n'
+  printf 'Custom EFI images use their own build/copy workflow, without make install.\n'
+  gentoo-config diff --stat
+}
+
+# Present the kernel phase plan and verify the mounted target before installation.
+# Run this same standalone script inside the chroot with resolved target options,
+# removing its temporary copy afterward and leaving mounts available on failure.
+install_kernel_foundation() {
+  local source status=0
+  log 'Phase: kernel-foundation'
+  resolve_kernel_firmware_policy
+  if [[ $MODE == dry-run && ! -e $MOUNT_ROOT/etc/gentoo-config/kernel-firmware.d/00-common ]]; then
+    TARGET_SOF_FIRMWARE='from target configuration (available after Portage foundation)'
+  else
+    read_kernel_firmware_policy "$MOUNT_ROOT"
+  fi
+  [[ $TARGET_HOST == qemu || -z $QEMU_VARS ]] || die '--qemu-vars is only valid for target qemu'
+  if (( VERBOSE )); then
+    cat <<'NOTES'
+Distribution kernel: a reliable installation and recovery foundation
+====================================================================
+
+Install the prebuilt, unmodified Gentoo distribution kernel. This avoids
+kernel compilation during installation and future world updates. A broad
+Dracut initramfs supports encrypted Btrfs, physical storage, QEMU VirtIO,
+and keyboard input. No host-only pruning or custom kernel configuration is
+used. The binary kernel and its virtual dependency stay on stable AMD64
+keywords to avoid pulling a testing source kernel during later world updates.
+auto microcode follows the installation host; override it when preparing
+another CPU vendor. SOF audio firmware follows the installed configuration:
+/etc/gentoo-config/kernel-firmware.d/00-common and optional 90-TARGET fragments.
+There is no SOF command-line override; edit the target configuration instead.
+Microcode selection is vendor-level: Intel adds intel-microcode, AMD uses
+linux-firmware. Firmware remains broad, with CPU matching performed at boot.
+The none option skips vendor-specific selection and verification; it does not
+remove microcode that the generic initramfs includes from installed firmware.
+
+Establish package and image-generation policy
+--------------------------------------------
+The phase writes /etc/portage/package.use/zz-kernel-foundation with dist-kernel,
+installkernel[systemd,dracut] and kernel-bin[initramfs,-generic-uki]. It disables
+boot-manager and EFI registration flags. /etc/kernel/install.conf selects:
+
+layout=efistub
+initrd_generator=dracut
+uki_generator=none
+BOOT_ROOT=/boot
+
+The layout copies an EFI kernel and separate initramfs onto the mounted ESP;
+it does not require USE=efistub (which would add firmware-registration hooks).
+An ESP guard stops distribution updates if the expected FAT partition is not
+mounted at /boot. Final system configuration must arrange this mount in fstab.
+The Dracut configuration keeps hostonly=no, early_microcode=yes, crypt/btrfs
+modules, and storage/keyboard drivers. These settings persist across updates.
+An existing policy file without the installer marker stops the phase so the
+user can inspect and reconcile it before retrying. Marked files are replaced
+in full, including edits retaining that marker. Conflicting saved boot parameters
+or ESP identity also stop the phase. These checks do not open a merge dialog
+or roll back earlier changes in the phase.
+
+Install prerequisites, then firmware and the kernel together
+-----------------------------------------------------------------
+Example commands inside the target chroot (Intel system with SOF audio):
+
+emerge --pretend --verbose --update --newuse sys-kernel/installkernel sys-kernel/dracut sys-fs/btrfs-progs sys-kernel/linux-firmware sys-firmware/intel-microcode sys-firmware/sof-firmware sys-fs/cryptsetup sys-boot/efibootmgr sys-kernel/gentoo-kernel-bin
+emerge --verbose --update --newuse sys-kernel/installkernel sys-kernel/dracut sys-fs/btrfs-progs sys-fs/cryptsetup sys-boot/efibootmgr
+emerge --verbose --update --newuse sys-kernel/linux-firmware sys-firmware/intel-microcode sys-firmware/sof-firmware sys-kernel/gentoo-kernel-bin
+emerge --oneshot @module-rebuild
+emerge --config =sys-kernel/gentoo-kernel-bin-6.18.54
+
+The first install command provides tools needed by Dracut inside the target.
+Keep kernel-bin explicitly selected in the firmware transaction so its virtual
+dependency cannot choose a source-built provider. The last command regenerates
+the selected installed kernel's initramfs after external modules are built.
+dist-kernel provides ongoing package integration,
+including NVIDIA when installed; no GPU driver is selected automatically.
+
+Read the target's firmware requirements
+--------------------------------------
+The common fragment sets SOF_FIRMWARE=no; 90-thinktop sets SOF_FIRMWARE=yes.
+The selected host fragment overrides common policy, independent of the CPU or
+audio hardware visible on the installation host. Missing common policy or an
+invalid value stops the phase before package installation.
+
+cat /etc/gentoo-config/kernel-firmware.d/00-common
+cat /etc/gentoo-config/kernel-firmware.d/90-thinktop
+
+Inspect actual target boot ingredients
+-------------------------------------
+Derive UUIDs from the target devices, never the host's running command line:
+
+blkid -s UUID -o value /dev/mapper/cryptroot
+cryptsetup luksUUID /dev/nbd0p2
+cat /etc/kernel/gentoo-dist.cmdline
+lsinitrd -m /boot/EFI/Gentoo/initramfs-6.18.54-gentoo-dist-bin.img
+lsinitrd /boot/EFI/Gentoo/initramfs-6.18.54-gentoo-dist-bin.img
+modinfo -k 6.18.54-gentoo-dist-bin btrfs
+modinfo -k 6.18.54-gentoo-dist-bin nvidia
+
+Only inspect NVIDIA if installed. The phase verifies the EFI executable,
+matching kernel/modules, cryptsetup or systemd-cryptsetup, crypt/btrfs modules,
+boot drivers and early microcode. It does not prove hardware behavior or
+successful boot.
+
+Maintenance and the boundary to first boot
+-----------------------------------------
+emerge --update --deep --newuse @world
+
+Distribution package hooks install versioned kernel/initramfs files beneath
+/boot/EFI/Gentoo. Register each new version manually with efibootmgr from the
+running target; keep a tested previous kernel and firmware entry. Firmware
+variables belong to the running machine, even inside a chroot. Registration
+from a UEFI live system on the destination physical machine is valid. For a VM,
+use the offline registration below. Do not register VM entries from
+the host-side NBD chroot, which exposes the physical host's firmware variables.
+Physical registration, first-boot configuration, and actual boot tests are later
+work. This phase does not write physical firmware or prune old EFI files.
+The future optimized kernel is independently built and copied to a distinct
+EFI path and explicit versioned source tree: distribution updates may change
+/usr/src/linux. Do not invoke make install for that path, which would run these
+hooks.
+
+Register QEMU firmware offline (target qemu only)
+------------------------------------------------
+Supply --qemu-vars with the VM's persistent raw OVMF variable-store file. For
+a new store, --qemu-vars-template selects the template matching the VM's OVMF
+CODE image. Existing stores are preserved, not reset from the template.
+The VM must be stopped. Host Python needs the upstream virt-firmware package.
+
+sudo pacman -S --needed virt-firmware
+virt-fw-vars --input /path/to/VM/OVMF_VARS.4m.fd --print
+./installer/gentoo-install.sh --disk /dev/nbd0 --target-host qemu \
+  --phase kernel-foundation --qemu-vars /path/to/VM/OVMF_VARS.4m.fd --verbose
+
+The equivalent host-side Python API operations are:
+
+store = Edk2VarStore(existing_vars_or_matching_template)
+variables = store.get_varlist()
+partition_node.set_gpt(1, esp_start_sector, esp_sector_count, esp_partition_guid)
+path = DevicePath()
+path.append(partition_node)
+path.extend(DevicePath.filepath(kernel_path))
+variables.set_boot_entry(index, label, path, utf16_kernel_cmdline_and_initrd)
+variables['BootOrder'].set_boot_order([index] + previous_other_entries)
+store.write_varstore(temporary_vars_path, variables)
+
+The installer obtains GPT identity with sfdisk --json, builds this partition
+plus file device path, and supplies the saved root/LUKS command line and initrd
+argument. It puts the selected kernel first while retaining previous entries,
+reuses a matching entry on retries, validates all variables after writing a
+temporary store, backs up a changed existing store, and replaces it atomically.
+Keep using this same variable-store file in QEMU on every subsequent boot.
+Successful offline registration prepares the VM entry; it does not prove boot.
+NOTES
+  fi
+  cat <<PLAN
+
+Distribution kernel plan
+Target root:          $MOUNT_ROOT
+Configuration target: $TARGET_HOST
+Kernel:               sys-kernel/gentoo-kernel-bin (stable AMD64 fallback)
+CPU microcode:        $TARGET_MICROCODE
+SOF audio firmware:   $TARGET_SOF_FIRMWARE
+EFI files:            /boot/EFI/Gentoo/kernel-VERSION.efi and initramfs-VERSION.img
+QEMU firmware store:  ${QEMU_VARS:-not specified; used only for target qemu}
+
+  * establish distribution-only package and Dracut policy;
+  * install broad firmware, microcode, and the binary distribution kernel;
+  * rebuild external modules and regenerate the matching initramfs;
+  * validate the direct EFI boot ingredients and print target boot parameters.
+PLAN
+  if [[ $TARGET_HOST == qemu ]]; then
+    printf '  * register the selected kernel in the offline VM firmware store, retaining older entries.\n'
+  fi
+  if [[ $MODE == dry-run ]]; then
+    printf '\nDry run: no packages, kernel policy, EFI files, or firmware stores changed.\n'
+    return
+  fi
+  [[ -n $TARGET_DISK ]] || die 'kernel-foundation requires --disk DEVICE'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  [[ -b $TARGET_DISK ]] || die "target is not a block device: $TARGET_DISK"
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+  verify_disk_setup || die 'kernel-foundation requires a verified disk layout'
+  for source in proc sys dev run; do
+    mountpoint -q "$MOUNT_ROOT/$source" || die "required chroot mount is missing: $source"
+  done
+  [[ -r $MOUNT_ROOT/etc/gentoo-release ]] || die 'the Gentoo target is missing'
+  check_qemu_firmware
+  confirm_phase 'distribution kernel foundation'
+  local helper=/run/$PROGRAM.kernel.$$
+  local -a options=()
+  (( ASSUME_YES == 0 )) || options+=(--yes)
+  run_privileged install -m 700 "$0" "$MOUNT_ROOT$helper"
+  run_privileged /bin/bash -c '
+    target_root=$1
+    helper=$2
+    shift 2
+    # Remove the temporary installer copy on success or failure.
+    # Preserve the chroot exit status so a failed phase remains visible to the caller.
+    cleanup_kernel_helper() {
+      local status=$?
+      trap - EXIT
+      rm -f -- "$target_root$helper" || printf "Warning: temporary kernel helper remains: %s\n" "$helper" >&2
+      exit "$status"
+    }
+    trap cleanup_kernel_helper EXIT
+    chroot "$target_root" /usr/bin/env -i \
+      HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      TERM="${TERM:-dumb}" /bin/bash "$helper" "$@"
+  ' "$PROGRAM-kernel" "$MOUNT_ROOT" "$helper" \
+    --internal-kernel-chroot --target-host "$TARGET_HOST" \
+    --disk "$TARGET_DISK" --luks-name "$LUKS_NAME" --root-subvol "$ROOT_SUBVOL" \
+    --microcode "$TARGET_MICROCODE" "${options[@]}" || status=$?
+  (( status == 0 )) || die 'kernel-foundation did not complete; target remains mounted for review and retry'
+  register_qemu_distribution_kernel \
+    || die 'offline QEMU registration did not complete; target remains mounted for review and retry'
+  log 'Distribution kernel foundation complete: boot ingredients validated; actual boot remains untested'
+}
+
 main() {
   parse_args "$@"
+  if (( INTERNAL_KERNEL_CHROOT )); then
+    kernel_foundation_chroot
+    return
+  fi
   if (( INTERNAL_UPDATE_CHROOT )); then
     system_update_chroot
     return
@@ -1511,6 +2237,10 @@ main() {
   if (( INTERNAL_PORTAGE_CHROOT )); then
     portage_foundation_chroot
     return
+  fi
+  # Resolve host firmware prerequisites before any earlier destructive phase.
+  if is_selected kernel-foundation && [[ $MODE != dry-run ]]; then
+    check_qemu_firmware
   fi
   if is_selected disk-setup; then
     disk_setup
@@ -1523,6 +2253,9 @@ main() {
   fi
   if is_selected system-update; then
     install_system_update
+  fi
+  if is_selected kernel-foundation; then
+    install_kernel_foundation
   fi
 }
 
