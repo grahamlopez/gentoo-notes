@@ -204,6 +204,12 @@ set_phase_selection() {
 parse_args() {
   while (($#)); do
     case $1 in
+      --disk|--phase|--luks-name|--btrfs-label|--root-subvol|--home-subvol|--efi-size|--mount-root|--config-source|--config-branch|--target-host|--timezone|--locale|--cpu-flags|--microcode|--qemu-vars|--qemu-vars-template|--hostname)
+        (($# >= 2)) && [[ $2 != --* ]] \
+          || die "$1 requires a value; use $PROGRAM --help for examples"
+        ;;
+    esac
+    case $1 in
       --disk)
         (($# >= 2)) || die '--disk requires a device path'
         TARGET_DISK=$2
@@ -304,11 +310,12 @@ parse_args() {
         ;;
       --qemu-vars=*) QEMU_VARS=${1#*=} ;;
       --qemu-vars-template)
+        QEMU_TEMPLATE_EXPLICIT=1
         (($# >= 2)) || die '--qemu-vars-template requires a file path'
         QEMU_VARS_TEMPLATE=$2
         shift
         ;;
-      --qemu-vars-template=*) QEMU_VARS_TEMPLATE=${1#*=} ;;
+      --qemu-vars-template=*) QEMU_TEMPLATE_EXPLICIT=1; QEMU_VARS_TEMPLATE=${1#*=} ;;
       --hostname)
         (($# >= 2)) || die '--hostname requires a value'
         TARGET_HOSTNAME=$2
@@ -330,6 +337,73 @@ parse_args() {
 }
 
 # Runtime interaction
+
+# Validate user inputs before any phase can modify the disk. Target-side state
+# and execution prerequisites remain checked where the phases use them.
+validate_arguments() {
+  local -a errors=()
+  local option value normalized
+  valid_target_host "$TARGET_HOST" || errors+=("--target-host '$TARGET_HOST' is unknown; choose generic, qemu, thinktop, or startop. Use --hostname for a custom machine name.")
+  case $TARGET_MICROCODE in
+    auto|intel|amd|none) ;;
+    *) errors+=("--microcode must be auto, intel, amd, or none.") ;;
+  esac
+  [[ $EFI_SIZE =~ ^[1-9][0-9]*[MmGg]$ ]] || errors+=("--efi-size must be a positive size such as 1G or 512M.")
+  normalized=$(readlink -m -- "$MOUNT_ROOT")
+  [[ $MOUNT_ROOT == /* && $normalized != / && $MOUNT_ROOT != *$'\n'* ]] \
+    || errors+=("--mount-root must be an absolute directory other than /, such as /mnt/gentoo.")
+  for option in LUKS_NAME BTRFS_LABEL ROOT_SUBVOL HOME_SUBVOL; do
+    value=${!option}
+    [[ $value =~ ^[A-Za-z0-9._@+-]+$ && $value != . && $value != .. ]] \
+      || errors+=("$option must be a nonempty name using letters, numbers, dots, underscores, @, +, or hyphens; '.' and '..' are not allowed.")
+  done
+  [[ $ROOT_SUBVOL != "$HOME_SUBVOL" ]] || errors+=("--root-subvol and --home-subvol must differ.")
+  [[ -z $TARGET_HOSTNAME || ( ${#TARGET_HOSTNAME} -le 63 && $TARGET_HOSTNAME =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ) ]] \
+    || errors+=("--hostname must be one DNS label of at most 63 characters, with letters, numbers, and internal hyphens.")
+  [[ $TARGET_LOCALE =~ ^[A-Za-z][A-Za-z_]*\.(UTF-8|utf8)$ ]] \
+    || errors+=("--locale must be a UTF-8 locale such as en_US.UTF-8.")
+  [[ $TARGET_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ && -f /usr/share/zoneinfo/$TARGET_TIMEZONE ]] \
+    || errors+=("--timezone must name an installed timezone, such as America/New_York; see /usr/share/zoneinfo.")
+  [[ -z $TARGET_CPU_FLAGS || $TARGET_CPU_FLAGS =~ ^[a-z0-9_]+([[:blank:]][a-z0-9_]+)*$ ]] \
+    || errors+=("--cpu-flags must be a space-separated list of lowercase CPU flag names.")
+  [[ -n $CONFIG_SOURCE && $CONFIG_SOURCE != -* && $CONFIG_SOURCE != *$'\n'* && $CONFIG_SOURCE != *$'\r'* ]] \
+    || errors+=("--config-source must be a nonempty Git URL or local repository path.")
+  if command -v git >/dev/null 2>&1; then
+    git check-ref-format --branch "$CONFIG_BRANCH" >/dev/null 2>&1 \
+      || errors+=("--config-branch must be a valid Git branch name, such as main.")
+  else
+    errors+=("Install git so --config-branch can be validated before installation.")
+  fi
+  if [[ -z $TARGET_DISK ]]; then
+    errors+=("--disk is required; use lsblk to identify the separate whole target disk.")
+  elif [[ ! -b $TARGET_DISK ]]; then
+    errors+=("--disk '$TARGET_DISK' is not an available block device; check lsblk.")
+  elif [[ $(lsblk -dn -o TYPE "$TARGET_DISK") != disk ]]; then
+    errors+=("--disk must identify a whole disk, not a partition or encrypted mapping; check lsblk.")
+  fi
+  if [[ $TARGET_HOST != qemu && ( -n $QEMU_VARS || ${QEMU_TEMPLATE_EXPLICIT:-0} == 1 ) ]]; then
+    errors+=("--qemu-vars and --qemu-vars-template apply only to --target-host qemu; omit them for a physical target.")
+  fi
+  if [[ $TARGET_HOST == qemu ]]; then
+    if is_selected kernel-foundation && [[ -z $QEMU_VARS ]]; then
+      errors+=("--target-host qemu needs --qemu-vars FILE for kernel-foundation. Choose a new path in your VM directory, such as /path/to/VM/OVMF_VARS.4m.fd; the installer creates it from the OVMF template. See installer/QEMU-NBD-INSTALL.md.")
+    fi
+    if [[ -n $QEMU_VARS ]]; then
+      [[ $QEMU_VARS != *$'\n'* && $QEMU_VARS != *$'\r'* && ! -L $QEMU_VARS && ( ! -e $QEMU_VARS || -f $QEMU_VARS ) ]] \
+        || errors+=("--qemu-vars must be a regular file path, not a symlink or directory.")
+      [[ -d $(dirname -- "$QEMU_VARS") ]] || errors+=("Create the parent directory for --qemu-vars before running the installer.")
+      if is_selected kernel-foundation && [[ ! -e $QEMU_VARS ]]; then
+        [[ -f $QEMU_VARS_TEMPLATE && -r $QEMU_VARS_TEMPLATE ]] \
+          || errors+=("--qemu-vars-template is unavailable; install OVMF or supply a readable template matching your VM's OVMF CODE file.")
+      fi
+    fi
+  fi
+  if ((${#errors[@]})); then
+    printf 'Please correct these arguments before continuing:\n' >&2
+    printf '  * %s\n' "${errors[@]}" >&2
+    exit 1
+  fi
+}
 
 confirm_phase() {
   local phase=$1 answer
@@ -2588,6 +2662,7 @@ main() {
     portage_foundation_chroot
     return
   fi
+  validate_arguments
   # Resolve host firmware prerequisites before any earlier destructive phase.
   if is_selected kernel-foundation && [[ $MODE != dry-run ]]; then
     check_qemu_firmware

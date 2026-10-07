@@ -93,6 +93,15 @@ attach_target
 
 ## Run the installer against the attached target
 
+For a fresh installation, `--qemu-vars` names the new persistent firmware file
+you want the installer to create; you do not need to obtain that file first.
+The commands below place it at `$INSTALL_DIR/OVMF_VARS.4m.fd`. The installer
+creates it from `/usr/share/edk2/x64/OVMF_VARS.4m.fd`, installed by the host's
+OVMF/EDK2 firmware package. Create `$INSTALL_DIR` first, as in the setup above.
+If your distribution stores the template elsewhere, pass `--qemu-vars-template`
+with that path and use its matching OVMF CODE file when launching the VM.
+Keep the generated VARS file: it holds the boot entry and must be reused by QEMU.
+
 ```bash
 cd /home/graham/Projects/gentoo-notes
 ./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
