@@ -1856,6 +1856,47 @@ verify_distribution_kernel() {
   printf '\nValidated distribution kernel: %s\nEFI kernel: %s\nInitramfs: %s\n' "$version" "$image" "$initrd"
 }
 
+# Print manual physical-firmware commands for the release just validated.
+# Use the target disk and saved boot parameters; create-only preserves BootOrder,
+# and an optional BootNext command selects one boot without changing defaults.
+print_physical_kernel_boot_commands() {
+  local version=$1 cmdline=$2 esp_uuid=$3
+  local image="\\EFI\\Gentoo\\kernel-$version.efi"
+  local initrd="\\EFI\\Gentoo\\initramfs-$version.img"
+  local label="Gentoo distribution $version"
+  cat <<INSTRUCTIONS
+
+Manual EFI registration for this physical target
+------------------------------------------------
+Run these commands yourself from a UEFI-booted Linux environment on the
+motherboard that will boot this disk. The installer only prints them.
+Target disk: $TARGET_DISK
+ESP: partition 1, filesystem UUID $esp_uuid
+If you move the disk to another machine, confirm its device name there before
+running the registration command.
+
+# Inspect existing entries and boot order before making a manual change.
+sudo efibootmgr --verbose
+
+# Create this kernel's entry without adding it to the persistent BootOrder.
+INSTRUCTIONS
+  printf 'sudo efibootmgr --create-only --disk %q --part 1 \\\n' "$TARGET_DISK"
+  printf '  --label %q --loader %q \\\n' "$label" "$image"
+  printf '  --unicode %q\n' "$cmdline initrd=$initrd"
+  cat <<'INSTRUCTIONS'
+
+# Find the newly created entry by its label and note its four-digit Boot number.
+sudo efibootmgr --verbose
+
+# Optional: replace XXXX below with that number, then select it for ONE boot.
+# For example, Boot0007 means use 0007. BootOrder is unchanged.
+sudo efibootmgr --bootnext XXXX
+
+BootNext is cleared by firmware after use; it does not arrange a permanent
+default. Keep existing entries and images while validating this installation.
+INSTRUCTIONS
+}
+
 # Configure and install the binary fallback kernel inside the mounted Gentoo target.
 # Establish update policy, install tools/firmware, rebuild modules and initramfs,
 # then validate the selected release without writing firmware boot entries.
@@ -2000,6 +2041,7 @@ VERSION
     printf 'The host-side phase will now register this kernel in the offline VM firmware store.\n'
   else
     printf 'No firmware entry was registered. Register on the destination motherboard.\n'
+    print_physical_kernel_boot_commands "$version" "$cmdline" "$efi_uuid"
   fi
   printf 'After kernel updates, register the new version; retain a tested previous entry.\n'
   printf 'Custom EFI images use their own build/copy workflow, without make install.\n'
@@ -2119,6 +2161,22 @@ use the offline registration below. Do not register VM entries from
 the host-side NBD chroot, which exposes the physical host's firmware variables.
 Physical registration, first-boot configuration, and actual boot tests are later
 work. This phase does not write physical firmware or prune old EFI files.
+For physical targets, the phase ends by printing copy-ready efibootmgr commands
+for the validated disk, release, initramfs, and root/LUKS parameters. The commands
+use --create-only to leave the persistent BootOrder untouched. After reviewing
+the new Boot number, optionally use --bootnext NUMBER for a single boot test;
+firmware clears BootNext after use. No physical firmware command is executed
+by the installer, including when --yes is used.
+
+Example manual commands on the destination motherboard (replace the UUIDs):
+sudo efibootmgr --verbose
+sudo efibootmgr --create-only --disk /dev/nvme0n1 --part 1 \
+  --label 'Gentoo distribution 6.18.54-gentoo-dist-bin' \
+  --loader '\EFI\Gentoo\kernel-6.18.54-gentoo-dist-bin.efi' \
+  --unicode 'root=UUID=ROOT_UUID rootfstype=btrfs rootflags=subvol=@ rd.luks.uuid=luks-LUKS_UUID rd.luks.name=LUKS_UUID=cryptroot ro initrd=\EFI\Gentoo\initramfs-6.18.54-gentoo-dist-bin.img'
+sudo efibootmgr --verbose
+sudo efibootmgr --bootnext 0007 # Only if the new entry was Boot0007.
+
 The future optimized kernel is independently built and copied to a distinct
 EFI path and explicit versioned source tree: distribution updates may change
 /usr/src/linux. Do not invoke make install for that path, which would run these
