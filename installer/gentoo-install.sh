@@ -7,7 +7,7 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns six phases:
+# This installer currently owns seven phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
 #   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
@@ -19,11 +19,12 @@
 #   broad initramfs, then validate EFI files and register QEMU firmware offline.
 #   first-boot-foundation: configure mounts, identity, root login, minimal
 #   networking, persistent journal, time synchronization and Btrfs scrubbing.
+#   handoff: verify and unmount the target, close LUKS, and print boot guidance.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
 # kernel-foundation prepares the distribution fallback and QEMU EFI entry.
-# Physical EFI registration and actual boot verification remain later work; custom kernels
+# Physical EFI registration and actual boot verification remain manual; custom kernels
 # are built after installation.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
@@ -62,7 +63,7 @@ TARGET_TIMEZONE=${TARGET_TIMEZONE:-$DEFAULT_TIMEZONE}
 TARGET_LOCALE=${TARGET_LOCALE:-$DEFAULT_LOCALE}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation)
+SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation handoff)
 VERBOSE=0
 INTERNAL_PORTAGE_CHROOT=0
 INTERNAL_UPDATE_CHROOT=0
@@ -82,7 +83,7 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation)
+PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation handoff)
 
 usage() {
   cat <<EOF
@@ -105,13 +106,13 @@ Options:
                               It does not affect execution or confirmations.
   --phase NAME               Run a named phase (currently: disk-setup,
                               stage3-bootstrap, portage-foundation, system-update,
-                              kernel-foundation, first-boot-foundation). May be
+                              kernel-foundation, first-boot-foundation, handoff). May be
                               repeated; phases run in installer order.
   --config-source SOURCE     Public Git URL or local repository path
                               (default: $CONFIG_SOURCE).
   --config-branch BRANCH     Configuration branch to install
                               (default: $CONFIG_BRANCH).
-  --target-host NAME         Configuration target: generic, qemu, or thinktop
+  --target-host NAME         Configuration target: generic, qemu, thinktop, or startop
                               (default: $TARGET_HOST).
   --hostname NAME            Target hostname; defaults to named target-host, prompts
                               for generic/qemu (or preserves existing hostname).
@@ -1069,7 +1070,7 @@ EOF
 
 valid_target_host() {
   case $1 in
-    generic|qemu|thinktop) return 0 ;;
+    generic|qemu|thinktop|startop) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1821,7 +1822,9 @@ sudo efibootmgr --verbose
 
 # Create this kernel's entry without adding it to the persistent BootOrder.
 INSTRUCTIONS
-  printf 'sudo efibootmgr --create-only --disk %q --part 1 \\\n' "$TARGET_DISK"
+  local device_path_option=
+  [[ $TARGET_HOST != startop ]] || device_path_option=' --full-dev-path'
+  printf 'sudo efibootmgr --create-only%s --disk %q --part 1 \\\n' "$device_path_option" "$TARGET_DISK"
   printf '  --label %q --loader %q \\\n' "$label" "$image"
   printf '  --unicode %q\n' "$cmdline initrd=$initrd"
   cat <<'INSTRUCTIONS'
@@ -2518,6 +2521,54 @@ NOTES
     --luks-name "$LUKS_NAME" --root-subvol "$ROOT_SUBVOL" --home-subvol "$HOME_SUBVOL" "${options[@]}"
 }
 
+handoff() {
+  log 'Phase: handoff'
+  cat <<PLAN
+Handoff plan
+Target root: $MOUNT_ROOT
+  * verify the target disk layout and first-boot configuration;
+  * unmount chroot filesystems, the ESP, home, and root;
+  * close /dev/mapper/$LUKS_NAME; and
+  * leave the target powered off and print the remaining boot steps.
+PLAN
+  if (( VERBOSE )); then
+    printf '\nOrdinary unmounts stop on busy filesystems. No forced or lazy unmounts are used.\n'
+    printf 'NBD attachment and destination firmware selection remain manual.\n'
+  fi
+  [[ $MODE != dry-run ]] || { printf '\nDry run: no mounts or encrypted mappings changed.\n'; return; }
+  [[ -n $TARGET_DISK ]] || die 'handoff requires --disk'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+  verify_disk_setup || die 'handoff requires verified target mounts'
+  run_privileged test -s "$MOUNT_ROOT/etc/fstab" || die 'first-boot fstab is missing'
+  local version cmdline esp_uuid source
+  version=$(run_privileged tail -n 1 "$MOUNT_ROOT/etc/kernel/gentoo-dist.version")
+  [[ $version =~ ^[A-Za-z0-9._+-]+-gentoo-dist(-bin)?$ ]] || die 'invalid recorded kernel version'
+  cmdline=$(run_privileged cat "$MOUNT_ROOT/etc/kernel/gentoo-dist.cmdline")
+  esp_uuid=$(run_privileged cat "$MOUNT_ROOT/etc/kernel/gentoo-dist-esp.uuid")
+  confirm_phase 'handoff'
+  for source in run dev sys proc; do
+    if mountpoint -q "$MOUNT_ROOT/$source"; then
+      run_privileged umount --recursive "$MOUNT_ROOT/$source" || die "could not unmount $source; stop processes using the target and retry"
+    fi
+  done
+  for source in "$MOUNT_ROOT/boot" "$MOUNT_ROOT/home" "$MOUNT_ROOT"; do
+    run_privileged umount "$source" || die "could not unmount $source; remaining mounts and LUKS mapping are preserved"
+  done
+  run_privileged cryptsetup close "$LUKS_NAME"
+  log 'Handoff complete: target unmounted and LUKS closed'
+  if [[ $TARGET_HOST == qemu ]]; then
+    printf 'Disconnect the NBD attachment before starting QEMU. Use the prepared OVMF store: %s\n' "$QEMU_VARS"
+    printf 'Follow installer/QEMU-NBD-INSTALL.md for the VM boot command.\n'
+  else
+    print_physical_kernel_boot_commands "$version" "$cmdline" "$esp_uuid"
+  fi
+  printf 'Unlock LUKS, log in with the target root password, and verify mounts, networking and failed services.\n'
+}
+
 main() {
   parse_args "$@"
   if (( INTERNAL_FIRSTBOOT_OFFLINE )); then
@@ -2558,6 +2609,9 @@ main() {
   fi
   if is_selected first-boot-foundation; then
     install_firstboot_foundation
+  fi
+  if is_selected handoff; then
+    handoff
   fi
 }
 

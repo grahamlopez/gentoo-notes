@@ -102,13 +102,12 @@ cd /home/graham/Projects/gentoo-notes
   --config-source "$CONFIG_SOURCE" --config-branch "$CONFIG_BRANCH" \
   --target-host qemu --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --verbose
 
-sudo findmnt -R /mnt/gentoo
-sudo bash -c '[[ -r /mnt/gentoo/etc/gentoo-release ]]'
-sudo chroot /mnt/gentoo /bin/bash -c \
-  '[[ -r /proc/cpuinfo && -c /dev/null && -d /sys && -r /etc/resolv.conf ]]'
-sudo chroot /mnt/gentoo /bin/bash -c \
-  'grep -Fxq '\''GENTOO_TARGET_HOST="qemu"'\'' /etc/gentoo-config/target-host && [[ -d /var/db/repos/gentoo/.git ]]'
 ```
+
+The default run finishes with `handoff`: it unmounts the target and closes LUKS.
+After successful completion, proceed to detachment and boot testing below.
+The phase-resume instructions below apply when installation stopped before
+handoff and the target is still mounted.
 
 The default installer now also runs `system-update`. CPU detection occurs on
 the installation host; the VM boot command below uses `-cpu host` to expose
@@ -165,7 +164,13 @@ prepared target, resume it separately:
 
 Enter your host administrator password if sudo asks for it. When the installer
 asks you to create the Gentoo root login password, enter your chosen new guest
-password twice. Continue with detachment after the phase completes successfully.
+password twice. If you resumed first-boot configuration separately, run handoff
+before detachment:
+
+```bash
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --qemu-vars "$INSTALL_DIR/OVMF_VARS.4m.fd" --phase handoff
+```
 
 ## Detach and preserve the target for later work
 
