@@ -197,7 +197,7 @@ if [[ -f "$INSTALL_DIR/OVMF_VARS.4m.fd" ]]; then
     -cpu host \
     -m 4096 \
     -smp 4 \
-    -nic user,model=virtio-net-pci \
+    -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22 \
     -display none -serial mon:stdio \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
     -drive if=pflash,format=raw,file="$INSTALL_DIR/OVMF_VARS.4m.fd" \
@@ -210,6 +210,31 @@ fi
 Enter the disk-encryption passphrase at the unlock prompt, then log in as
 `root` using the guest root password set during first-boot configuration.
 Use Ctrl-a c to switch between the serial console and QEMU monitor.
+
+### SSH from the host
+
+The boot command forwards host `127.0.0.1:2222` to guest TCP port 22. The
+forward is accessible only from the host. Relaunch QEMU with the updated command
+if the VM was started without it; a guest reboot alone does not add the forward.
+
+After unlocking the disk, use the guest serial console to install and enable
+the SSH server, if needed:
+
+```bash
+emerge --ask net-misc/openssh
+systemctl enable --now sshd
+```
+
+From a host terminal, connect using a guest account authorized for SSH:
+
+```bash
+ssh -p 2222 guest-user@127.0.0.1
+```
+
+Replace `guest-user` with your guest username. For `root`, configure an authorized
+SSH key in the guest's `/root/.ssh/authorized_keys`; the guest root password set
+by the installer does not by itself guarantee SSH login is permitted. Keep the
+serial console available for disk unlocking and SSH setup.
 
 ## Verify the running guest
 
