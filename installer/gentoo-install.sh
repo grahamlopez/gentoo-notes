@@ -7,7 +7,7 @@
 # code that implements it.  Run with `--verbose` to print the technical notes
 # for each selected phase, or read the source directly.
 #
-# This installer currently owns five phases:
+# This installer currently owns six phases:
 #   disk-setup: validate the target, then create GPT → EFI → LUKS2 → Btrfs →
 #   @ + @home.
 #   stage3-bootstrap: obtain and verify the current official AMD64 desktop-
@@ -17,11 +17,13 @@
 #   system-update: establish CPU policy, update @world, and review configuration.
 #   kernel-foundation: install the binary distribution kernel, firmware, and
 #   broad initramfs, then validate EFI files and register QEMU firmware offline.
+#   first-boot-foundation: configure mounts, identity, root login, minimal
+#   networking, persistent journal, time synchronization and Btrfs scrubbing.
 #
 # It executes selected phases by default.  Use --dry-run to print plans without
 # making changes.  Disk setup also requires confirmation of the exact target.
 # kernel-foundation prepares the distribution fallback and QEMU EFI entry.
-# Physical EFI registration and first boot remain later work; custom kernels
+# Physical EFI registration and actual boot verification remain later work; custom kernels
 # are built after installation.
 
 if [[ -z ${BASH_VERSION:-} ]]; then
@@ -60,7 +62,7 @@ TARGET_TIMEZONE=${TARGET_TIMEZONE:-$DEFAULT_TIMEZONE}
 TARGET_LOCALE=${TARGET_LOCALE:-$DEFAULT_LOCALE}
 MODE=apply
 ASSUME_YES=0
-SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation)
+SELECTED_PHASES=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation)
 VERBOSE=0
 INTERNAL_PORTAGE_CHROOT=0
 INTERNAL_UPDATE_CHROOT=0
@@ -69,6 +71,8 @@ TARGET_MICROCODE=${TARGET_MICROCODE:-auto}
 TARGET_SOF_FIRMWARE=
 QEMU_VARS=${QEMU_VARS:-}
 QEMU_VARS_TEMPLATE=${QEMU_VARS_TEMPLATE:-/usr/share/edk2/x64/OVMF_VARS.4m.fd}
+TARGET_HOSTNAME=${TARGET_HOSTNAME:-}
+INTERNAL_FIRSTBOOT_OFFLINE=0
 TARGET_CPU_FLAGS=${TARGET_CPU_FLAGS:-}
 
 EFI_PARTITION=
@@ -78,7 +82,7 @@ MOUNTED_HOME=0
 MOUNTED_EFI=0
 LUKS_OPENED=0
 
-PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation)
+PHASE_ORDER=(disk-setup stage3-bootstrap portage-foundation system-update kernel-foundation first-boot-foundation)
 
 usage() {
   cat <<EOF
@@ -87,7 +91,7 @@ Usage: $PROGRAM --disk DEVICE [options]
 Install the selected Gentoo phases.  The current milestone prepares an
 encrypted Btrfs disk, bootstraps the verified stage3, and establishes the
 target's Portage configuration, then updates the base system and prepares
-the distribution kernel for direct EFI boot.
+the distribution kernel for direct EFI boot, then configures first boot.
 
 Required:
   --disk DEVICE              Whole block device to erase, for example /dev/nvme0n1
@@ -101,7 +105,7 @@ Options:
                               It does not affect execution or confirmations.
   --phase NAME               Run a named phase (currently: disk-setup,
                               stage3-bootstrap, portage-foundation, system-update,
-                              kernel-foundation). May be
+                              kernel-foundation, first-boot-foundation). May be
                               repeated; phases run in installer order.
   --config-source SOURCE     Public Git URL or local repository path
                               (default: $CONFIG_SOURCE).
@@ -109,6 +113,8 @@ Options:
                               (default: $CONFIG_BRANCH).
   --target-host NAME         Configuration target: generic, qemu, or thinktop
                               (default: $TARGET_HOST).
+  --hostname NAME            Target hostname; defaults to named target-host, prompts
+                              for generic/qemu (or preserves existing hostname).
   --cpu-flags FLAGS          Explicit CPU_FLAGS_X86 flags for another target;
                               otherwise detect the running CPU.
   --microcode KIND           auto, intel, amd, or none (default: $TARGET_MICROCODE).
@@ -131,7 +137,7 @@ Options:
 Environment overrides mirror these options: TARGET_DISK, LUKS_NAME,
 BTRFS_LABEL, ROOT_SUBVOL, HOME_SUBVOL, EFI_SIZE, MOUNT_ROOT, CONFIG_SOURCE,
 CONFIG_BRANCH, TARGET_HOST, TARGET_TIMEZONE, TARGET_LOCALE, TARGET_CPU_FLAGS,
-TARGET_MICROCODE, QEMU_VARS, and QEMU_VARS_TEMPLATE.
+TARGET_MICROCODE, TARGET_HOSTNAME, QEMU_VARS, and QEMU_VARS_TEMPLATE.
 SOF audio firmware is selected by the target's gentoo-config fragments.
 
 Safety model:
@@ -162,7 +168,7 @@ run_privileged() {
   if (( EUID == 0 )); then
     "$@"
   else
-    sudo -- "$@"
+    sudo -p "Host administrator password for %p (authorizes this installer; does not set a Gentoo password): " -- "$@"
   fi
 }
 
@@ -302,6 +308,13 @@ parse_args() {
         shift
         ;;
       --qemu-vars-template=*) QEMU_VARS_TEMPLATE=${1#*=} ;;
+      --hostname)
+        (($# >= 2)) || die '--hostname requires a value'
+        TARGET_HOSTNAME=$2
+        shift
+        ;;
+      --hostname=*) TARGET_HOSTNAME=${1#*=} ;;
+      --internal-firstboot-offline) INTERNAL_FIRSTBOOT_OFFLINE=1 ;;
       --internal-kernel-chroot) INTERNAL_KERNEL_CHROOT=1 ;;
       --internal-update-chroot) INTERNAL_UPDATE_CHROOT=1 ;;
       --internal-portage-chroot) INTERNAL_PORTAGE_CHROOT=1 ;;
@@ -485,9 +498,9 @@ prompt_luks_passphrase() {
   # piped directly to cryptsetup below and then removed from shell state.
   local first second
   [[ -r /dev/tty && -w /dev/tty ]] || die 'cannot securely prompt for a LUKS passphrase without a terminal'
-  printf 'New LUKS passphrase: ' >/dev/tty
+  printf 'New target disk LUKS passphrase: ' >/dev/tty
   IFS= read -r -s first </dev/tty || die 'could not read LUKS passphrase'
-  printf '\nConfirm LUKS passphrase: ' >/dev/tty
+  printf '\nConfirm target LUKS passphrase: ' >/dev/tty
   IFS= read -r -s second </dev/tty || die 'could not read LUKS passphrase confirmation'
   printf '\n' >/dev/tty
   [[ -n $first ]] || die 'empty LUKS passphrases are not accepted'
@@ -1626,11 +1639,9 @@ check_qemu_firmware() {
   [[ ! -L $QEMU_VARS ]] || die 'QEMU variable store must not be a symlink'
   QEMU_VARS=$(readlink -m -- "$QEMU_VARS")
   [[ -d ${QEMU_VARS%/*} ]] || die 'create the QEMU variable-store parent directory first'
-  require_command python3
+  require_command virt-fw-vars
+  require_command jq
   require_command fuser
-  require_command sfdisk
-  python3 -c 'from virt.firmware.varstore.edk2 import Edk2VarStore; from virt.firmware.efi import bootentry, devpath, ucs16' \
-    || die 'offline QEMU registration requires host Python virt-firmware (Arch: pacman -S virt-firmware)'
   if [[ -e $QEMU_VARS ]]; then
     [[ -f $QEMU_VARS ]] || die 'QEMU variable store must be a regular raw OVMF file'
     if run_privileged fuser -s "$QEMU_VARS"; then
@@ -1640,177 +1651,108 @@ check_qemu_firmware() {
     [[ -f $QEMU_VARS_TEMPLATE && -r $QEMU_VARS_TEMPLATE ]] \
       || die "matching OVMF template is unavailable: $QEMU_VARS_TEMPLATE"
   fi
-  python3 - "$QEMU_VARS" "$QEMU_VARS_TEMPLATE" <<'PY'
-import os
-import sys
-import fcntl
-from virt.firmware.varstore.edk2 import Edk2VarStore
-
-if os.path.exists(sys.argv[1]):
-    with open(sys.argv[1], 'r+b') as stream:
-        try:
-            fcntl.lockf(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            sys.exit('error: QEMU variable store is locked; stop the VM before offline registration')
-Edk2VarStore(sys.argv[1] if os.path.exists(sys.argv[1]) else sys.argv[2])
-PY
+  local source=$QEMU_VARS_TEMPLATE
+  [[ ! -e $QEMU_VARS ]] || source=$QEMU_VARS
+  run_privileged virt-fw-vars --input "$source" --print >/dev/null \
+    || die 'cannot read the raw OVMF variable store'
 }
 
-# Register the validated kernel in this VM's raw OVMF store, outside the chroot.
-# Bind the EFI path to the target GPT partition, preserve other variables and
-# entries, and verify a temporary output before atomically replacing the store.
-register_qemu_distribution_kernel() {
+# QEMU ONLY: edit the VM's offline OVMF file with the host virt-fw-vars CLI.
+# Physical targets never call this function or write firmware here; their manual
+# efibootmgr instructions are printed separately for the destination machine.
+# The CLI accepts "EFI-path kernel-arguments" as one --append-boot-filepath value.
+# Its file-only device path suits our single-disk VM, but does not bind to an ESP
+# GUID. Keep using this store with that VM; do not share it between installations.
+# A function subshell scopes temporary-file cleanup; operations remain in the
+# main installer and use its existing privilege helper where needed.
+register_qemu_distribution_kernel() (
   [[ $TARGET_HOST == qemu ]] || return 0
   check_qemu_firmware
   log 'Registering the distribution kernel in QEMU firmware offline'
-  run_privileged python3 - "$QEMU_VARS" "$QEMU_VARS_TEMPLATE" \
-    "$TARGET_DISK" "$EFI_PARTITION" "$MOUNT_ROOT" <<'PY'
-import fcntl
-import json
-import os
-from pathlib import Path
-import re
-import shutil
-import stat
-import struct
-import subprocess
-import sys
-import tempfile
-from virt.firmware.efi import bootentry, devpath, ucs16
-from virt.firmware.varstore.edk2 import Edk2VarStore
-
-# Compare every live variable, including authenticated-variable timestamps.
-# This verifies preservation as well as the newly generated boot entry.
-def firmware_state(variables):
-    return {name: (v.guid, v.attr, v.data, v.bytes_time() if v.time else None)
-            for name, v in variables.items()}
-
-destination, template, disk, esp, root = map(Path, sys.argv[1:])
-locks = []
-temporary = None
-backup = None
-try:
-    # Lock existing and replacement inodes against QEMU's POSIX file locking.
-    exists = destination.exists()
-    if destination.is_symlink():
-        raise ValueError('variable store must not be a symlink')
-    if exists:
-        descriptor = os.open(destination, os.O_RDWR | os.O_NOFOLLOW)
-        locks.append(descriptor)
-        fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ownership = os.fstat(descriptor)
-        if not stat.S_ISREG(ownership.st_mode):
-            raise ValueError('variable store must be a regular file')
-    else:
-        ownership = destination.parent.stat()
-    store = Edk2VarStore(str(destination if exists else template))
-    if exists:
-        fcntl.lockf(locks[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
-    variables = store.get_varlist()
-    table = json.loads(subprocess.check_output(
-        ['sfdisk', '--json', str(disk)], text=True))['partitiontable']
-    if table['label'] != 'gpt' or table.get('unit') != 'sectors':
-        raise ValueError('offline EFI registration requires GPT')
-    partitions = [p for p in table['partitions'] if Path(p['node']).resolve() == esp.resolve()]
-    if len(partitions) != 1:
-        raise ValueError('could not identify the target ESP in GPT')
-    partition = partitions[0]
-    if partition['type'].lower() != 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b':
-        raise ValueError('target partition is not an ESP')
-    # sfdisk reports start/size in this disk's logical sectors, as UEFI requires.
-    version_lines = (root / 'etc/kernel/gentoo-dist.version').read_text().splitlines()
-    if len(version_lines) != 2 or version_lines[0] != '# Managed by gentoo-install kernel-foundation.':
-        raise ValueError('missing installer-validated distribution kernel version')
-    version = version_lines[1]
-    if not re.fullmatch(r'[A-Za-z0-9._+-]+-gentoo-dist(?:-bin)?', version):
-        raise ValueError('unexpected distribution kernel release')
-    kernel = rf'\EFI\Gentoo\kernel-{version}.efi'
-    initrd = rf'\EFI\Gentoo\initramfs-{version}.img'
-    for filename in (f'kernel-{version}.efi', f'initramfs-{version}.img'):
-        if (root / 'boot/EFI/Gentoo' / filename).stat().st_size == 0:
-            raise ValueError(f'empty boot artifact: {filename}')
-    cmdline = (root / 'etc/kernel/gentoo-dist.cmdline').read_text().rstrip('\n')
-    if not cmdline or any(c in cmdline for c in '\r\n\0'):
-        raise ValueError('kernel command line must be a single nonempty line')
-    options = bytes(ucs16.from_string(f'{cmdline} initrd={initrd}'))
-    path = devpath.DevicePath()
-    node = devpath.DevicePathElem()
-    node.set_gpt(1, partition['start'], partition['size'], partition['uuid'])
-    path.append(node)
-    path.extend(devpath.DevicePath.filepath(kernel))
-    title = f'Gentoo distribution {version}'
-    matching = []
-    for name, variable in variables.items():
-        if not re.fullmatch(r'Boot[0-9A-Fa-f]{4}', name):
-            continue
-        entry = bootentry.BootEntry(variable.data)
-        if str(entry.title).startswith('Gentoo distribution '):
-            guids = [str(n.get_partuuid()).lower() for n in entry.devicepath if n.get_partuuid()]
-            if guids != [partition['uuid'].lower()]:
-                raise ValueError('existing Gentoo entry belongs to another ESP; review the VM store')
-        if entry.devicepath == path:
-            matching.append(int(name[4:], 16))
-    if len(matching) > 1:
-        raise ValueError('multiple entries already match this kernel; review the VM store')
-    before = firmware_state(variables)
-    if matching:
-        index = matching[0]
-        variables.set_boot_entry(index, title, path, options)
-    else:
-        index = variables.add_boot_entry(title, path, options)
-        if index is None:
-            raise ValueError('no free EFI boot entry number')
-    order_variable = variables.get('BootOrder')
-    order_data = order_variable.data if order_variable else b''
-    if len(order_data) % 2:
-        raise ValueError('malformed BootOrder')
-    order = list(struct.unpack(f'<{len(order_data) // 2}H', order_data))
-    if order_variable is None:
-        order_variable = variables.create('BootOrder')
-    order_variable.set_boot_order([index] + [n for n in order if n != index])
-    expected = firmware_state(variables)
-    if exists and before == expected:
-        print(f'QEMU firmware already contains Boot{index:04X}: {title}')
-        sys.exit(0)
-    descriptor, temporary = tempfile.mkstemp(prefix=f'.{destination.name}.', dir=destination.parent)
-    locks.append(descriptor)
-    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    store.write_varstore(temporary, variables)
-    with open(temporary, 'rb') as stream:
-        os.fsync(stream.fileno())
-    reopened = Edk2VarStore(temporary)
-    actual = firmware_state(reopened.get_varlist())
-    if actual != expected or len(reopened.filedata) != len(store.filedata):
-        raise ValueError('offline firmware output failed round-trip validation')
-    # Library reads/writes close descriptors, releasing process-scoped POSIX
-    # locks. Reacquire after the final read before publishing the new inode.
-    fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    os.fchown(descriptor, ownership.st_uid, ownership.st_gid)
-    os.fchmod(descriptor, stat.S_IMODE(ownership.st_mode) if exists else 0o600)
-    if exists:
-        backup_fd, backup = tempfile.mkstemp(prefix=f'{destination.name}.backup-', dir=destination.parent)
-        os.close(backup_fd)
-        shutil.copy2(destination, backup)
-        os.chown(backup, ownership.st_uid, ownership.st_gid)
-        fcntl.lockf(locks[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
-    os.replace(temporary, destination)
-    temporary = None
-    print(f'Registered Boot{index:04X}: {title}')
-    print(f'ESP partition GUID: {partition["uuid"]}')
-    print(f'EFI path: {kernel}\nLoad options: {options.decode("utf-16-le").rstrip(chr(0))}')
-    print(f'VM firmware store: {destination}')
-    if backup:
-        print(f'Previous firmware store: {backup}')
-except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
-    print(f'error: offline QEMU EFI registration failed: {error}', file=sys.stderr)
-    sys.exit(1)
-finally:
-    if temporary:
-        os.unlink(temporary)
-    for descriptor in locks:
-        os.close(descriptor)
-PY
-}
+  set -Eeuo pipefail
+  trap "die 'offline QEMU registration failed; target remains mounted for review and retry'" ERR
+  umask 077
+  vars=$QEMU_VARS template=$QEMU_VARS_TEMPLATE root=$MOUNT_ROOT
+  source=$template
+  [[ ! -e $vars ]] || source=$vars
+  work=$(mktemp -d)
+  publish=
+  trap 'rm -rf -- "$work"; if [[ -n $publish ]]; then run_privileged rm -f -- "$publish"; fi' EXIT
+  version=$(run_privileged sed -n '2p' "$root/etc/kernel/gentoo-dist.version")
+  [[ $(run_privileged head -n 1 "$root/etc/kernel/gentoo-dist.version") == '# Managed by gentoo-install kernel-foundation.'
+     && $version =~ ^[A-Za-z0-9._+-]+-gentoo-dist(-bin)?$ ]]
+  kernel="\\EFI\\Gentoo\\kernel-$version.efi"
+  initrd="\\EFI\\Gentoo\\initramfs-$version.img"
+  run_privileged test -s "$root/boot/EFI/Gentoo/kernel-$version.efi"
+  run_privileged test -s "$root/boot/EFI/Gentoo/initramfs-$version.img"
+  cmdline=$(run_privileged cat "$root/etc/kernel/gentoo-dist.cmdline")
+  [[ -n $cmdline && $cmdline != *$'\n'* && $cmdline != *$'\r'* ]]
+  run_privileged virt-fw-vars --input "$source" --output-json /dev/stdout >"$work/before.json"
+  # Only the QEMU VM store is passed to the CLI, never the host's live EFI variables.
+  run_privileged virt-fw-vars --input "$source" --output "$work/appended.fd" \
+    --append-boot-filepath "$kernel $cmdline console=tty0 console=ttyS0,115200n8 initrd=$initrd"
+  run_privileged virt-fw-vars --input "$work/appended.fd" --output-json /dev/stdout >"$work/appended.json"
+  # Identify the CLI-created entry and reuse an identical entry on ordinary retries.
+  new=$(jq -er --slurpfile before "$work/before.json" '
+    [$before[0].variables[].name] as $names |
+    [.variables[] | select(.name | test("^Boot[0-9A-Fa-f]{4}$")) |
+     select(.name as $n | $names | index($n) | not)] |
+    if length == 1 then .[0].name else error("expected one new boot entry") end
+  ' "$work/appended.json")
+  entry=$(jq -er --arg name "$new" '.variables[] | select(.name == $name) | .data' "$work/appended.json")
+  matching=$(jq -er --arg data "$entry" --arg new "$new" '
+    [.variables[] | select(.name | test("^Boot[0-9A-Fa-f]{4}$")) |
+     select(.name != $new and .data == $data) | .name] |
+    if length > 1 then error("duplicate matching boot entries require review")
+    else .[0] // $new end
+  ' "$work/appended.json")
+  # BootOrder is a sequence of little-endian 16-bit entry numbers. Move the selected
+  # entry first while retaining all other entries; jq edits only this JSON variable.
+  number="${matching:6:2}${matching:4:2}"
+  appended_number="${new:6:2}${new:4:2}"
+  jq --arg number "${number,,}" --arg appended "${appended_number,,}" '
+    [.variables[] | select(.name == "BootOrder") |
+     .data = ($number + ([.data | scan("....") | select(ascii_downcase != $number and ascii_downcase != $appended)] | join("")))] |
+    {version: 2, variables: .}
+  ' "$work/appended.json" >"$work/order.json"
+  options=()
+  [[ $matching == "$new" ]] || options+=(--delete "$new")
+  run_privileged virt-fw-vars --input "$work/appended.fd" --output "$work/final.fd" \
+    "${options[@]}" --set-json "$work/order.json"
+  run_privileged virt-fw-vars --input "$work/final.fd" --output-json /dev/stdout >"$work/final.json"
+  # Verify the selected entry/order and preservation of all previous other variables.
+  jq -e --arg selected "$matching" --arg data "$entry" --arg number "${number,,}" \
+    --slurpfile before "$work/before.json" '
+    any(.variables[]; .name == $selected and .data == $data) and
+    any(.variables[]; .name == "BootOrder" and (.data | startswith($number))) and
+    (.variables as $after | all($before[0].variables[] | select(.name != "BootOrder");
+      . as $old | any($after[]; . == $old)))
+  ' "$work/final.json" >/dev/null
+  if [[ -e $vars ]]; then
+    if cmp -s "$work/before.json" "$work/final.json"; then
+      printf 'QEMU firmware already contains %s: %s\n' "$matching" "$kernel"
+      exit 0
+    fi
+    # Recheck immediately before publishing; the VM must stay stopped throughout.
+    ! run_privileged fuser -s "$vars" || { printf 'Stop QEMU before updating its firmware store.\n' >&2; exit 1; }
+    backup=$(run_privileged mktemp "${vars}.backup-XXXXXX")
+    run_privileged cp --preserve=all -- "$vars" "$backup"
+    printf 'Previous QEMU firmware store: %s\n' "$backup"
+  fi
+  # Publish on the destination filesystem so the final rename is atomic.
+  publish=$(run_privileged mktemp "${vars}.new-XXXXXX")
+  run_privileged cp -- "$work/final.fd" "$publish"
+  if [[ -e $vars ]]; then
+    run_privileged chown --reference="$vars" "$publish"
+    run_privileged chmod --reference="$vars" "$publish"
+  else
+    run_privileged chown --reference="${vars%/*}" "$publish"
+    run_privileged chmod 600 "$publish"
+  fi
+  run_privileged mv -f -- "$publish" "$vars"
+  publish=
+  printf 'Registered QEMU %s: %s\nVM firmware store: %s\n' "$matching" "$kernel" "$vars"
+)
 
 # Inspect the installed release and initramfs for matching EFI/kernel artifacts,
 # encrypted-root tools, boot drivers, microcode, and any installed NVIDIA modules.
@@ -2075,7 +2017,6 @@ keywords to avoid pulling a testing source kernel during later world updates.
 auto microcode follows the installation host; override it when preparing
 another CPU vendor. SOF audio firmware follows the installed configuration:
 /etc/gentoo-config/kernel-firmware.d/00-common and optional 90-TARGET fragments.
-There is no SOF command-line override; edit the target configuration instead.
 Microcode selection is vendor-level: Intel adds intel-microcode, AMD uses
 linux-firmware. Firmware remains broad, with CPU matching performed at boot.
 The none option skips vendor-specific selection and verification; it does not
@@ -2153,14 +2094,19 @@ Maintenance and the boundary to first boot
 emerge --update --deep --newuse @world
 
 Distribution package hooks install versioned kernel/initramfs files beneath
-/boot/EFI/Gentoo. Register each new version manually with efibootmgr from the
-running target; keep a tested previous kernel and firmware entry. Firmware
-variables belong to the running machine, even inside a chroot. Registration
+/boot/EFI/Gentoo. For later physical-system kernel updates, the user registers
+each new version manually with efibootmgr from the running target. Retaining a
+previous kernel and EFI entry known to boot is user maintenance advice, not an
+installer-managed recovery policy. A fresh installation has no previous Gentoo
+kernel to retain. QEMU registration preserves entries already in its variable
+store, but cannot determine whether any entry has been successfully boot-tested.
+Firmware variables belong to the running machine, even inside a chroot. Registration
 from a UEFI live system on the destination physical machine is valid. For a VM,
 use the offline registration below. Do not register VM entries from
 the host-side NBD chroot, which exposes the physical host's firmware variables.
-Physical registration, first-boot configuration, and actual boot tests are later
-work. This phase does not write physical firmware or prune old EFI files.
+First-boot configuration follows in first-boot-foundation. Physical
+registration and actual boot tests remain outside this kernel phase. This phase
+does not write physical firmware or prune old EFI files.
 For physical targets, the phase ends by printing copy-ready efibootmgr commands
 for the validated disk, release, initramfs, and root/LUKS parameters. The commands
 use --create-only to leave the persistent BootOrder untouched. After reviewing
@@ -2187,30 +2133,21 @@ Register QEMU firmware offline (target qemu only)
 Supply --qemu-vars with the VM's persistent raw OVMF variable-store file. For
 a new store, --qemu-vars-template selects the template matching the VM's OVMF
 CODE image. Existing stores are preserved, not reset from the template.
-The VM must be stopped. Host Python needs the upstream virt-firmware package.
+The VM must be stopped. The host needs virt-fw-vars and jq.
 
-sudo pacman -S --needed virt-firmware
+sudo pacman -S --needed virt-firmware jq
 virt-fw-vars --input /path/to/VM/OVMF_VARS.4m.fd --print
 ./installer/gentoo-install.sh --disk /dev/nbd0 --target-host qemu \
   --phase kernel-foundation --qemu-vars /path/to/VM/OVMF_VARS.4m.fd --verbose
 
-The equivalent host-side Python API operations are:
-
-store = Edk2VarStore(existing_vars_or_matching_template)
-variables = store.get_varlist()
-partition_node.set_gpt(1, esp_start_sector, esp_sector_count, esp_partition_guid)
-path = DevicePath()
-path.append(partition_node)
-path.extend(DevicePath.filepath(kernel_path))
-variables.set_boot_entry(index, label, path, utf16_kernel_cmdline_and_initrd)
-variables['BootOrder'].set_boot_order([index] + previous_other_entries)
-store.write_varstore(temporary_vars_path, variables)
-
-The installer obtains GPT identity with sfdisk --json, builds this partition
-plus file device path, and supplies the saved root/LUKS command line and initrd
-argument. It puts the selected kernel first while retaining previous entries,
-reuses a matching entry on retries, validates all variables after writing a
-temporary store, backs up a changed existing store, and replaces it atomically.
+The QEMU-only registration uses virt-fw-vars --append-boot-filepath with the
+EFI path, saved root/LUKS arguments, serial-console arguments and initrd path.
+The CLI constructs the EFI entry; the installer reuses an identical entry on
+retries, puts it first in BootOrder, preserves other variables, validates a
+temporary store, and backs up a changed existing store before replacing it.
+The file-only device path is intended for this single-disk VM, not physical
+firmware or a shared variable store. Physical targets print efibootmgr commands
+for manual execution on the destination machine instead.
 Keep using this same variable-store file in QEMU on every subsequent boot.
 Successful offline registration prepares the VM entry; it does not prove boot.
 NOTES
@@ -2277,13 +2214,318 @@ PLAN
     --disk "$TARGET_DISK" --luks-name "$LUKS_NAME" --root-subvol "$ROOT_SUBVOL" \
     --microcode "$TARGET_MICROCODE" "${options[@]}" || status=$?
   (( status == 0 )) || die 'kernel-foundation did not complete; target remains mounted for review and retry'
-  register_qemu_distribution_kernel \
-    || die 'offline QEMU registration did not complete; target remains mounted for review and retry'
+  # Offline firmware editing is exclusively for the QEMU target.
+  if [[ $TARGET_HOST == qemu ]]; then
+    register_qemu_distribution_kernel
+  fi
   log 'Distribution kernel foundation complete: boot ingredients validated; actual boot remains untested'
+}
+
+# First boot foundation: configure the mounted target without contacting its bus.
+# References: Gentoo Handbook Installation/System and Installation/Tools;
+# systemd-firstboot(1), systemctl(1), and dhcpcd's 20-resolv.conf hook.
+# Runtime initialization is automatic at boot. This phase establishes persistent
+# identity, mounts, credentials and explicit service policy before that boot.
+firstboot_offline() {
+  (( EUID == 0 )) || die 'offline first-boot setup requires root'
+  local root=$MOUNT_ROOT root_uuid esp_uuid hostname=$TARGET_HOSTNAME command unit
+  [[ -r $root/etc/gentoo-release && -d $root/var/lib/gentoo-config/repository.git ]] \
+    || die 'first-boot-foundation requires the configured Gentoo target'
+  grep -Fxq "GENTOO_TARGET_HOST=\"$TARGET_HOST\"" "$root/etc/gentoo-config/target-host" \
+    || die 'target-host differs from the installed configuration'
+  for command in systemd-firstboot systemctl python3; do require_command "$command"; done
+  [[ -x $root/usr/lib/systemd/systemd-timesyncd ]] || die 'target systemd lacks timesyncd'
+  [[ -s $root/etc/kernel/gentoo-dist.cmdline ]] || die 'run kernel-foundation first'
+  [[ $ROOT_SUBVOL =~ ^[A-Za-z0-9_@.-]+$ && $HOME_SUBVOL =~ ^[A-Za-z0-9_@.-]+$ ]] \
+    || die 'unsupported Btrfs subvolume name'
+  if [[ -z $hostname && $TARGET_HOST != generic && $TARGET_HOST != qemu ]]; then hostname=$TARGET_HOST; fi
+  if [[ -z $hostname && -s $root/etc/hostname ]]; then hostname=$(cat "$root/etc/hostname"); fi
+  if [[ -z $hostname ]]; then
+    [[ -r /dev/tty ]] || die 'supply --hostname when no terminal is available'
+    printf 'Target hostname: ' >/dev/tty
+    IFS= read -r hostname </dev/tty || die 'could not read hostname'
+  fi
+  [[ ${#hostname} -le 63 && $hostname =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
+    || die 'hostname must be one DNS label, at most 63 characters'
+  [[ ! -s $root/etc/hostname || $(cat "$root/etc/hostname") == "$hostname" ]] \
+    || die 'existing hostname conflicts with requested hostname'
+  root_uuid=$(blkid -s UUID -o value "/dev/mapper/$LUKS_NAME")
+  esp_uuid=$(blkid -s UUID -o value "$EFI_PARTITION")
+  [[ $root_uuid =~ ^[[:xdigit:]-]+$ && $esp_uuid =~ ^[[:xdigit:]-]+$ ]] || die 'invalid filesystem UUIDs'
+  [[ $(cat "$root/etc/kernel/gentoo-dist-esp.uuid") == "$esp_uuid" ]] || die 'kernel ESP identity differs'
+  grep -Fq "rootflags=subvol=$ROOT_SUBVOL " "$root/etc/kernel/gentoo-dist.cmdline" || die 'kernel root subvolume differs'
+  grep -Fq "root=UUID=$root_uuid " "$root/etc/kernel/gentoo-dist.cmdline" || die 'kernel root UUID differs'
+
+  # Run package operations inside the target, but never start services there.
+  local -a packages=(net-misc/dhcpcd)
+  [[ $TARGET_HOST == qemu ]] || packages+=(net-wireless/wpa_supplicant)
+  chroot "$root" /usr/bin/emerge --pretend --verbose --update --newuse --usepkg=n --getbinpkg=n "${packages[@]}"
+  confirm_phase 'first-boot networking packages (review the plan above)'
+  chroot "$root" /usr/bin/emerge --verbose --update --newuse --usepkg=n --getbinpkg=n "${packages[@]}"
+
+  # Python writes persistent files atomically and rejects unowned conflicts.
+  # Imported credentials are never printed, passed in argv, or tracked in Git.
+  python3 - "$root" "$TARGET_HOST" "$root_uuid" "$esp_uuid" "$ROOT_SUBVOL" "$HOME_SUBVOL" <<'PYTHON'
+import configparser, getpass, hashlib, os, pathlib, re, tempfile
+import sys
+root, target, uuid, esp, subvol, home = sys.argv[1:]
+base = pathlib.Path(root)
+marker = '# Managed by gentoo-install first-boot-foundation.\n'
+def write(name, content, mode=0o644, allow_comments=False, marked=True):
+    desired = (marker if marked else "") + content
+    path = base / name.lstrip('/')
+    if path.is_symlink():
+        raise SystemExit(f'Refusing symlink at {name}')
+    if path.exists():
+        old = path.read_text()
+        if old == desired:
+            os.chmod(path, mode)
+            return
+        harmless = allow_comments and all(not x.strip() or x.lstrip().startswith('#') for x in old.splitlines())
+        if not old.startswith(marker) and not harmless:
+            raise SystemExit(f'Existing {name} requires manual review')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(desired)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+write('/etc/fstab', f'UUID={uuid} / btrfs noatime,compress=zstd:1,subvol={subvol} 0 0\n'
+      f'UUID={uuid} /home btrfs noatime,compress=zstd:1,subvol={home} 0 0\n'
+      f'UUID={esp} /boot vfat umask=0077 0 2\n', allow_comments=True)
+write('/etc/adjtime', '0.0 0 0.0\n0\nUTC\n', marked=False)
+write('/etc/systemd/journald.conf.d/90-first-boot.conf', '[Journal]\nStorage=persistent\nSystemMaxUse=256M\nSystemKeepFree=512M\n')
+# An invalid command prevents dhcpcd from selecting systemd's resolvconf shim.
+write('/etc/dhcpcd/gentoo-install.conf', 'hostname\nclientid\noption domain_name_servers, domain_name, domain_search\n'
+      'option classless_static_routes\noption interface_mtu\nrequire dhcp_server_identifier\n'
+      'slaac private\nnohook wpa_supplicant, hostname\nenv resolvconf=/nonexistent/gentoo-install-resolvconf\n', allow_comments=True)
+write('/etc/systemd/system/dhcpcd.service.d/90-first-boot.conf', '[Service]\nExecStart=\n'
+      'ExecStart=/sbin/dhcpcd -q -f /etc/dhcpcd/gentoo-install.conf\n')
+write('/etc/systemd/system/gentoo-btrfs-scrub.service', '[Unit]\nDescription=Scrub the Gentoo Btrfs filesystem\n'
+      'RequiresMountsFor=/\n[Service]\nType=oneshot\nExecStart=/usr/bin/btrfs scrub start -B /\n'
+      'TimeoutStartSec=infinity\nNice=19\nIOSchedulingClass=idle\n')
+write('/etc/systemd/system/gentoo-btrfs-scrub.timer', '[Unit]\nDescription=Monthly Btrfs integrity check\n'
+      '[Timer]\nOnCalendar=monthly\nPersistent=true\nRandomizedDelaySec=1d\n'
+      '[Install]\nWantedBy=timers.target\n')
+# Only scrub: no automatic balance, defragmentation, or encrypted discard policy.
+if target == 'qemu':
+    print('QEMU: DHCP on virtual Ethernet; no Wi-Fi credentials imported.')
+else:
+    destination = base / 'etc/wpa_supplicant/gentoo-install.conf'
+    if not destination.exists() and not destination.is_symlink():
+        networks = []
+        def supplicant_blocks(data):
+            # Match braces only outside quoted strings and comments.
+            blocks, start, depth, quoted, escaped, comment = [], None, 0, False, False, False
+            for i, c in enumerate(data):
+                if comment:
+                    if c == '\n': comment = False
+                    continue
+                if escaped: escaped = False; continue
+                if quoted and c == '\\': escaped = True; continue
+                if c == '"': quoted = not quoted; continue
+                if quoted: continue
+                if c == '#': comment = True; continue
+                if c == '{':
+                    if depth == 0:
+                        match = re.search(r'network\s*=\s*$', data[:i])
+                        start = match.start() if match else None
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth < 0: return []
+                    if depth == 0 and start is not None: blocks.append(data[start:i+1])
+            return blocks if depth == 0 and not quoted else []
+        # Reuse a self-contained supplicant configuration; certificate paths need
+        # explicit provisioning and must not silently refer to files on the host.
+        candidates = list(pathlib.Path('/etc/wpa_supplicant').glob('*.conf'))
+        candidates += [pathlib.Path('/etc/wpa_supplicant.conf')]
+        for candidate in candidates:
+            if not candidate.is_file(): continue
+            data = candidate.read_text()
+            if re.search(r'^\s*(ca_cert\w*|client_cert\w*|private_key\w*|include|eap)\s*=', data, re.M):
+                continue
+            blocks = supplicant_blocks(data)
+            networks.extend(blocks)
+        # NetworkManager keyfiles: support saved personal WPA-PSK/SAE and open
+        # networks. Do not guess enterprise, WEP, or externally stored secrets.
+        def network(ssid, key='', method='WPA-PSK'):
+            encoded = ssid.encode('utf-8')
+            if not 1 <= len(encoded) <= 32: return None
+            if method == 'NONE': return f'network={{\n ssid={encoded.hex()}\n key_mgmt=NONE\n}}'
+            if method == 'SAE':
+                if not key or any(ord(c) < 32 for c in key): return None
+                escaped = key.replace('\\', '\\\\').replace('"', '\\"')
+                return f'network={{\n ssid={encoded.hex()}\n key_mgmt=SAE\n ieee80211w=2\n sae_password="{escaped}"\n}}'
+            if re.fullmatch(r'[0-9a-fA-F]{64}', key): psk = key
+            elif 8 <= len(key) <= 63:
+                psk = hashlib.pbkdf2_hmac('sha1', key.encode(), encoded, 4096, 32).hex()
+            else: return None
+            return f'network={{\n ssid={encoded.hex()}\n key_mgmt=WPA-PSK\n psk={psk}\n}}'
+        for candidate in pathlib.Path('/etc/NetworkManager/system-connections').glob('*'):
+            if not candidate.is_file(): continue
+            config = configparser.ConfigParser(interpolation=None, strict=False)
+            try: config.read_string(candidate.read_text())
+            except (configparser.Error, UnicodeError): continue
+            section = 'wifi' if config.has_section('wifi') else '802-11-wireless'
+            if not config.has_section(section): continue
+            ssid = config.get(section, 'ssid', fallback='')
+            # Keyfile escaping and byte-array SSIDs need a dedicated converter.
+            if '\\' in ssid or re.fullmatch(r'(\d+;)+', ssid): continue
+            security = 'wifi-security' if config.has_section('wifi-security') else '802-11-wireless-security'
+            if config.get(section, 'security', fallback='') and not config.has_section(security): continue
+            method = config.get(security, 'key-mgmt', fallback='none')
+            if method not in ('none', 'wpa-psk', 'sae'): continue
+            block = network(ssid, config.get(security, 'psk', fallback=''),
+                            {'none':'NONE','wpa-psk':'WPA-PSK','sae':'SAE'}[method])
+            if block: networks.append(block)
+        if not networks:
+            print('Enterprise profiles, external certificate paths and unavailable secrets are not imported.')
+            with open('/dev/tty', 'r+') as tty:
+                tty.write('No supported saved Wi-Fi credentials. SSID (blank to defer Wi-Fi): '); tty.flush()
+                ssid = tty.readline().rstrip('\n')
+                if ssid:
+                    password = getpass.getpass('Wi-Fi password (blank for an open network): ', stream=tty)
+                    block = network(ssid, password, 'WPA-PSK' if password else 'NONE')
+                    if not block: raise SystemExit('Invalid SSID or WPA password')
+                    networks.append(block)
+        if networks:
+            write('/etc/wpa_supplicant/gentoo-install.conf', 'ctrl_interface=/run/wpa_supplicant\n'
+                  'update_config=0\n' + '\n'.join(dict.fromkeys(networks)) + '\n', 0o600)
+            print('Saved supported Wi-Fi profiles in a root-only target file.')
+        else: print('Wi-Fi deferred; Ethernet DHCP is configured.')
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.read_text().startswith(marker):
+            raise SystemExit('Existing Wi-Fi configuration requires manual review')
+        os.chmod(destination, 0o600)
+        write('/etc/systemd/system/gentoo-wifi@.service', '[Unit]\nDescription=Wi-Fi authentication on %I\n'
+              'BindsTo=sys-subsystem-net-devices-%i.device\nAfter=sys-subsystem-net-devices-%i.device\n'
+              '[Service]\nType=simple\nExecStart=/usr/sbin/wpa_supplicant -i %I -c /etc/wpa_supplicant/gentoo-install.conf\n'
+              'Restart=on-failure\nRestartSec=5\n')
+        write('/etc/udev/rules.d/80-gentoo-wifi.rules', 'ACTION=="add", SUBSYSTEM=="net", TEST=="phy80211", '
+              'TAG+="systemd", ENV{SYSTEMD_WANTS}+="gentoo-wifi@%k.service"\n')
+    exclude = base / 'var/lib/gentoo-config/repository.git/info/exclude'
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text() if exclude.exists() else ''
+    if '/etc/wpa_supplicant/gentoo-install.conf' not in existing.splitlines():
+        with exclude.open('a') as stream: stream.write('\n/etc/wpa_supplicant/gentoo-install.conf\n')
+PYTHON
+  # Fresh identity is random, not inherited from the shared host /run or D-Bus.
+  # firstboot preserves already initialized values; never use --reset/--force.
+  systemd-firstboot --root="$root" --hostname="$hostname" --setup-machine-id
+  # Some stage3 shadow files already have a locked entry. passwd deliberately
+  # initializes it; firstboot may regard an existing entry as already configured.
+  if ! awk -F: '$1 == "root" { if ($2 == "" || $2 ~ /^[!*]/) exit 1; found=1 } END { if (!found) exit 1 }' "$root/etc/shadow"; then
+    printf '\nSet the Gentoo root login password for %s.\n' "$hostname"
+    printf 'The next "Enter new password" prompts create this target login password.\n'
+    printf 'Enter the same new password twice; it is used to log in as root after boot.\n'
+    printf 'This does not change the disk encryption passphrase or any host password.\n\n'
+    chroot "$root" /usr/bin/passwd root
+  else
+    printf 'Gentoo root login password is already set; preserving it.\n'
+  fi
+  [[ $(cat "$root/etc/machine-id") =~ ^[[:xdigit:]]{32}$ ]] || die 'target machine ID is invalid'
+  local version
+  version=$(tail -n 1 "$root/etc/kernel/gentoo-dist.version")
+  [[ $version =~ ^[A-Za-z0-9._+-]+-gentoo-dist(-bin)?$ ]] || die 'invalid recorded kernel version'
+  [[ -s $root/boot/EFI/Gentoo/kernel-$version.efi && -s $root/boot/EFI/Gentoo/initramfs-$version.img && -d $root/lib/modules/$version ]] \
+    || die 'distribution kernel, initramfs or modules are missing'
+  # The bootstrap resolver is a regular copy, not a link to the host's resolver.
+  [[ -f $root/etc/resolv.conf && ! -L $root/etc/resolv.conf ]] || die 'target resolv.conf must be a regular file for dhcpcd'
+  systemctl --root="$root" preset-all --preset-mode=enable-only
+  for unit in NetworkManager.service systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service systemd-resolved.service wpa_supplicant.service iwd.service syslog-ng.service rsyslog.service syslog.service sysklogd.service metalog.service chronyd.service ntpd.service; do
+    if [[ -e $root/usr/lib/systemd/system/$unit || -e $root/etc/systemd/system/$unit ]]; then
+      systemctl --root="$root" disable "$unit"
+    fi
+  done
+  # Disable packaged per-interface supplicants to avoid racing our udev-started
+  # instance. Do not remove unrelated units or edit host service state.
+  local link
+  for link in "$root"/etc/systemd/system/*.wants/wpa_supplicant@*.service; do
+    [[ -L $link ]] || continue
+    systemctl --root="$root" disable "${link##*/}"
+  done
+  systemctl --root="$root" enable dhcpcd.service systemd-timesyncd.service gentoo-btrfs-scrub.timer
+  for unit in dhcpcd.service systemd-timesyncd.service gentoo-btrfs-scrub.timer; do
+    systemctl --root="$root" is-enabled "$unit" >/dev/null || die "service not enabled: $unit"
+  done
+  chroot "$root" findmnt --verify --tab-file /etc/fstab
+  awk -F: '$1 == "root" { if ($2 == "" || $2 ~ /^[!*]/) exit 1; found=1 } END { if (!found) exit 1 }' "$root/etc/shadow" \
+    || die 'root has no usable password; set it in the target and retry'
+  printf '\nFirst-boot foundation complete for %s. Runtime services have not been started.\n' "$hostname"
+  printf 'Boot the target and verify DHCP/DNS, timedatectl timesync-status, journalctl --list-boots, and the scrub timer.\n'
+  printf 'Physical targets still require their EFI entry registered on the destination motherboard.\n'
+}
+
+install_firstboot_foundation() {
+  log 'Phase: first-boot-foundation'
+  cat <<PLAN
+Target root: $MOUNT_ROOT
+Hostname: ${TARGET_HOSTNAME:-$([[ $TARGET_HOST == generic || $TARGET_HOST == qemu ]] && printf 'prompt (or preserve existing)' || printf '%s' "$TARGET_HOST")}
+Clock: UTC
+Networking: dhcpcd; $([[ $TARGET_HOST == qemu ]] && printf 'virtual Ethernet only' || printf 'import supported host Wi-Fi profiles, otherwise prompt')
+Logging: persistent journald, 256 MiB cap, 512 MiB kept free
+Time: enable existing systemd-timesyncd (no added time-service packages)
+Storage: UUID mounts and monthly Btrfs scrub (no automatic balance/defrag)
+PLAN
+  if (( VERBOSE )); then
+    cat <<'NOTES'
+--hostname selects the target hostname. Without it, a named physical target
+uses --target-host; generic/qemu preserves an existing hostname or prompts.
+An existing root password is preserved; a missing or locked password prompts
+for a new Gentoo root login password, including with --yes.
+
+Configure identity and credentials with systemd-firstboot --root, then apply
+Gentoo's enable-only presets before explicit offline service selection. UTC
+is written to the target adjtime file; the host hardware clock is untouched.
+No live systemctl, timedatectl, hostnamectl, or daemon-reload is used.
+
+Wi-Fi credentials remain local root-only state, excluded from gentoo-config.
+Physical targets import self-contained wpa_supplicant network blocks and saved
+NetworkManager personal WPA-PSK/SAE/open profiles. Enterprise profiles, external
+certificates and unavailable secrets require separate provisioning. If no
+supported profile exists, prompt for SSID/password or defer Wi-Fi. Existing
+installer Wi-Fi credentials are preserved on retries. A udev rule starts one
+supplicant per target wireless interface without importing host device names.
+QEMU uses virtual Ethernet and receives DHCP/DNS from its host-side backend.
+
+dhcpcd owns routes and resolv.conf directly; competing network services are
+disabled. Its built-in supplicant hook is disabled to avoid duplicate instances.
+The scrub runs once monthly for the shared root/home filesystem. No extra
+logging daemon, cron daemon, NTP package, or Btrfs maintenance package is needed.
+Policy files reject unmarked conflicts, including active existing fstab or
+installer policy configuration; reconcile these before retrying. The phase is resumable
+but does not roll back earlier writes or package installation on failure.
+NOTES
+  fi
+  [[ $MODE != dry-run ]] || { printf '\nDry run: no configuration, credentials, packages, or services changed.\n'; return; }
+  [[ -n $TARGET_DISK ]] || die 'first-boot-foundation requires --disk'
+  TARGET_DISK=$(readlink -f -- "$TARGET_DISK")
+  case ${TARGET_DISK##*/} in
+    *[0-9]) EFI_PARTITION=${TARGET_DISK}p1; CRYPT_PARTITION=${TARGET_DISK}p2 ;;
+    *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
+  esac
+  verify_disk_setup || die 'first-boot-foundation requires verified target mounts'
+  local source
+  for source in proc sys dev run; do mountpoint -q "$MOUNT_ROOT/$source" || die "missing chroot mount: $source"; done
+  confirm_phase 'first-boot foundation'
+  local -a options=()
+  (( ASSUME_YES == 0 )) || options+=(--yes)
+  run_privileged /bin/bash "$0" --internal-firstboot-offline --disk "$TARGET_DISK" \
+    --mount-root "$MOUNT_ROOT" --target-host "$TARGET_HOST" --hostname "$TARGET_HOSTNAME" \
+    --luks-name "$LUKS_NAME" --root-subvol "$ROOT_SUBVOL" --home-subvol "$HOME_SUBVOL" "${options[@]}"
 }
 
 main() {
   parse_args "$@"
+  if (( INTERNAL_FIRSTBOOT_OFFLINE )); then
+    case ${TARGET_DISK##*/} in *[0-9]) EFI_PARTITION=${TARGET_DISK}p1 ;; *) EFI_PARTITION=${TARGET_DISK}1 ;; esac
+    firstboot_offline
+    return
+  fi
   if (( INTERNAL_KERNEL_CHROOT )); then
     kernel_foundation_chroot
     return
@@ -2314,6 +2556,9 @@ main() {
   fi
   if is_selected kernel-foundation; then
     install_kernel_foundation
+  fi
+  if is_selected first-boot-foundation; then
+    install_firstboot_foundation
   fi
 }
 

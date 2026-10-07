@@ -11,7 +11,7 @@ running these instructions is the production path.
 ## Host tools
 
 ```bash
-sudo pacman -S --needed qemu-base virt-firmware psmisc btrfs-progs cryptsetup curl dosfstools git gnupg
+sudo pacman -S --needed qemu-base virt-firmware jq python psmisc btrfs-progs cryptsetup curl dosfstools git gnupg
 ```
 
 ## Set up this install shell
@@ -149,7 +149,23 @@ Stop the VM before running this phase. It creates or updates the specified
 OVMF store offline; use that same file in the QEMU command below. The default
 template matches the CODE file shown below; for another OVMF build, supply
 `--qemu-vars-template` with its matching VARS template. Detach NBD before
-starting QEMU. First-boot configuration and boot testing remain a later step.
+starting QEMU. Run first-boot configuration below before boot testing.
+
+## Configure first boot
+
+The default installer includes `first-boot-foundation`. For a previously
+prepared target, resume it separately:
+
+```bash
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --hostname gentoo-vm --phase first-boot-foundation --dry-run --verbose
+./installer/gentoo-install.sh --disk "$NBD_DEVICE" \
+  --target-host qemu --hostname gentoo-vm --phase first-boot-foundation --verbose
+```
+
+Enter your host administrator password if sudo asks for it. When the installer
+asks you to create the Gentoo root login password, enter your chosen new guest
+password twice. Continue with detachment after the phase completes successfully.
 
 ## Detach and preserve the target for later work
 
@@ -181,6 +197,8 @@ if [[ -f "$INSTALL_DIR/OVMF_VARS.4m.fd" ]]; then
     -cpu host \
     -m 4096 \
     -smp 4 \
+    -nic user,model=virtio-net-pci \
+    -display none -serial mon:stdio \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
     -drive if=pflash,format=raw,file="$INSTALL_DIR/OVMF_VARS.4m.fd" \
     -drive if=virtio,format=qcow2,file="$IMAGE"
@@ -188,3 +206,47 @@ else
   printf 'Run kernel-foundation to prepare the VM firmware store first.\n'
 fi
 ```
+
+Enter the disk-encryption passphrase at the unlock prompt, then log in as
+`root` using the guest root password set during first-boot configuration.
+Use Ctrl-a c to switch between the serial console and QEMU monitor.
+
+## Verify the running guest
+
+Run these commands in the guest root console:
+
+```bash
+findmnt --target /
+findmnt --target /home
+findmnt --target /boot
+systemctl --failed --no-pager
+ip address
+getent hosts gentoo.org
+curl --head --fail --max-time 20 https://www.gentoo.org/
+systemctl is-active dhcpcd systemd-timesyncd
+timedatectl status
+timedatectl timesync-status
+systemctl list-timers gentoo-btrfs-scrub.timer --no-pager
+systemctl start gentoo-btrfs-scrub.service
+btrfs scrub status /
+journalctl --list-boots --no-pager
+```
+
+For a reboot check, note the printed machine ID and write a journal message:
+
+```bash
+cat /etc/machine-id
+logger -t install-check "Journal persistence check before reboot"
+reboot
+```
+
+Unlock the disk and log in as root again, then run:
+
+```bash
+cat /etc/machine-id
+journalctl --list-boots --no-pager
+journalctl -b -1 -t install-check --no-pager
+```
+
+Confirm that the machine ID matches the previous output, both boots are listed,
+and the previous boot's tagged message is readable.
