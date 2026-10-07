@@ -949,8 +949,7 @@ EOF
     *) EFI_PARTITION=${TARGET_DISK}1; CRYPT_PARTITION=${TARGET_DISK}2 ;;
   esac
 
-  if [[ $MODE == dry-run ]]; then
-    cat <<EOF
+  cat <<EOF
 
 Stage3 bootstrap plan
   * verify the mounted disk-setup layout below $MOUNT_ROOT;
@@ -959,9 +958,9 @@ Stage3 bootstrap plan
     SHA-256 manifest;
   * extract the archive into $MOUNT_ROOT; and
   * prepare DNS and the chroot mounts (/proc, /sys, /dev, /run).
-
-Dry run: no network access or filesystem changes made.
 EOF
+  if [[ $MODE == dry-run ]]; then
+    printf '\nDry run: no network access or filesystem changes made.\n'
     return 0
   fi
 
